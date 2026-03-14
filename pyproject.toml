@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lensu"
+version = "1.5.0"
+description = "Cinema lens calibration tool for Unreal Engine virtual production"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [{name = "Javier Herreros Riaza", email = "hello@javierherreros.xyz"}]
+keywords = ["lens", "calibration", "unreal-engine", "virtual-production", "opencv", "cinema"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = [
+    "opencv-python-headless>=4.8",
+    "streamlit>=1.20",
+    "numpy>=1.24",
+    "reportlab>=4.0",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+lensu = "src.cli:main"
+lensu-gui = "src.app:launch"
+
+[project.urls]
+Homepage = "https://github.com/jhriaza/lensu"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["src", "src.*"]
+
+[tool.setuptools.package-data]
+"src.presets" = ["*.json"]

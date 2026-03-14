@@ -8,15 +8,30 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from calibration import (
-    CalibrationDiagnostics,
-    CalibrationPoint,
-    LensProfile,
-    calibrate_anamorphic_detailed,
-    calibrate_from_charuco_images,
-    calibrate_from_images,
-)
-from video_extractor import extract_frames_from_video
+try:
+    from .calibration import (
+        CalibrationImageResult,
+        CalibrationDiagnostics,
+        CalibrationPoint,
+        LensProfile,
+        calibrate_anamorphic_detailed,
+        calibrate_fisheye,
+        calibrate_from_charuco_images,
+        calibrate_from_images,
+    )
+    from .video_extractor import extract_frames_from_video
+except ImportError:
+    from calibration import (
+        CalibrationImageResult,
+        CalibrationDiagnostics,
+        CalibrationPoint,
+        LensProfile,
+        calibrate_anamorphic_detailed,
+        calibrate_fisheye,
+        calibrate_from_charuco_images,
+        calibrate_from_images,
+    )
+    from video_extractor import extract_frames_from_video
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
@@ -69,6 +84,7 @@ def _calibrate_folder(
     square_size_mm: float,
     detection_mode: str,
     anamorphic_enabled: bool = False,
+    fisheye_enabled: bool = False,
     squeeze_ratio: float = 2.0,
     anamorphic_desqueezed: bool = False,
 ) -> tuple[CalibrationPoint | None, CalibrationDiagnostics, int]:
@@ -77,6 +93,33 @@ def _calibrate_folder(
     ]
     if not image_paths:
         return None, CalibrationDiagnostics(image_size=None), 0
+
+    if fisheye_enabled:
+        first_image = image_paths[0]
+        point, used_flags = calibrate_fisheye(
+            image_paths,
+            pattern_size=pattern_size,
+            square_size_mm=square_size_mm,
+            focal_length_mm=focal_length_mm,
+        )
+        diagnostics = CalibrationDiagnostics(image_size=None)
+        try:
+            import cv2
+
+            image = cv2.imread(str(first_image))
+            if image is not None:
+                diagnostics.image_size = (image.shape[1], image.shape[0])
+        except Exception:
+            pass
+        diagnostics.image_results = [
+            CalibrationImageResult(
+                image_name=path.name,
+                used=used,
+                detection_mode="Fisheye Checkerboard",
+            )
+            for path, used in zip(image_paths, used_flags)
+        ]
+        return point, diagnostics, len(image_paths)
 
     if anamorphic_enabled and detection_mode.lower() != "charuco":
         point, diagnostics, _ = calibrate_anamorphic_detailed(
@@ -122,6 +165,7 @@ def batch_calibrate_detailed(
     sensor_height_mm: float = 24.0,
     progress_callback: ProgressCallback | None = None,
     anamorphic_enabled: bool = False,
+    fisheye_enabled: bool = False,
     squeeze_ratio: float = 2.0,
     anamorphic_desqueezed: bool = False,
 ) -> tuple[LensProfile, list[BatchFolderResult]]:
@@ -143,6 +187,7 @@ def batch_calibrate_detailed(
             square_size_mm,
             detection_mode,
             anamorphic_enabled=anamorphic_enabled,
+            fisheye_enabled=fisheye_enabled,
             squeeze_ratio=squeeze_ratio,
             anamorphic_desqueezed=anamorphic_desqueezed,
         )
@@ -185,6 +230,7 @@ def batch_calibrate(
     sensor_width_mm: float = 36.0,
     sensor_height_mm: float = 24.0,
     anamorphic_enabled: bool = False,
+    fisheye_enabled: bool = False,
     squeeze_ratio: float = 2.0,
     anamorphic_desqueezed: bool = False,
 ) -> LensProfile:
@@ -198,6 +244,7 @@ def batch_calibrate(
         sensor_width_mm=sensor_width_mm,
         sensor_height_mm=sensor_height_mm,
         anamorphic_enabled=anamorphic_enabled,
+        fisheye_enabled=fisheye_enabled,
         squeeze_ratio=squeeze_ratio,
         anamorphic_desqueezed=anamorphic_desqueezed,
     )

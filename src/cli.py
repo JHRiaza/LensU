@@ -6,18 +6,34 @@ import argparse
 import sys
 from pathlib import Path
 
-from batch import batch_calibrate_detailed
-from board_generator import generate_charuco_pdf, generate_checkerboard_pdf
-from calibration import LensProfile, calibrate_from_charuco_images, calibrate_from_images
-from lens_library import (
-    LIBRARY_DIR,
-    delete_from_library,
-    list_library,
-    load_from_library,
-    save_to_library,
-    search_library,
-)
-from ue_export import export_ue_json, export_ue_python_script
+try:
+    from . import __version__
+    from .batch import batch_calibrate_detailed
+    from .board_generator import generate_charuco_pdf, generate_checkerboard_pdf
+    from .calibration import LensProfile, calibrate_from_charuco_images, calibrate_from_images
+    from .lens_library import (
+        LIBRARY_DIR,
+        delete_from_library,
+        list_library,
+        load_from_library,
+        save_to_library,
+        search_library,
+    )
+    from .ue_export import export_ue_json, export_ue_python_script
+except ImportError:
+    __version__ = "1.5.0"
+    from batch import batch_calibrate_detailed
+    from board_generator import generate_charuco_pdf, generate_checkerboard_pdf
+    from calibration import LensProfile, calibrate_from_charuco_images, calibrate_from_images
+    from lens_library import (
+        LIBRARY_DIR,
+        delete_from_library,
+        list_library,
+        load_from_library,
+        save_to_library,
+        search_library,
+    )
+    from ue_export import export_ue_json, export_ue_python_script
 
 
 SENSOR_PRESETS = {
@@ -267,6 +283,7 @@ def _cmd_library(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="lensu", description="LensU CLI")
+    parser.add_argument("--version", action="version", version=f"lensu {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     calibrate = subparsers.add_parser("calibrate", help="Single focal-length calibration")

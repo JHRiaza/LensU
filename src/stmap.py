@@ -9,11 +9,18 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from calibration import (
-    CalibrationPoint,
-    reconstruct_camera_matrix,
-    reconstruct_dist_coeffs,
-)
+try:
+    from .calibration import (
+        CalibrationPoint,
+        reconstruct_camera_matrix,
+        reconstruct_dist_coeffs,
+    )
+except ImportError:
+    from calibration import (
+        CalibrationPoint,
+        reconstruct_camera_matrix,
+        reconstruct_dist_coeffs,
+    )
 
 
 def _scaled_camera_matrix(camera_matrix: np.ndarray, image_size: tuple[int, int], output_size: tuple[int, int]) -> np.ndarray:
@@ -86,5 +93,18 @@ def generate_stmap_from_calibration(
 
     camera_matrix = reconstruct_camera_matrix(point, image_size)
     dist_coeffs = reconstruct_dist_coeffs(point)
-    stmap = generate_stmap(camera_matrix, dist_coeffs, image_size)
+    if point.is_fisheye:
+        map_x, map_y = cv2.fisheye.initUndistortRectifyMap(
+            camera_matrix,
+            dist_coeffs,
+            np.eye(3, dtype=np.float32),
+            camera_matrix,
+            image_size,
+            cv2.CV_32FC1,
+        )
+        stmap = np.zeros((image_size[1], image_size[0], 3), dtype=np.float32)
+        stmap[..., 0] = (map_x + 0.5) / float(image_size[0])
+        stmap[..., 1] = (map_y + 0.5) / float(image_size[1])
+    else:
+        stmap = generate_stmap(camera_matrix, dist_coeffs, image_size)
     return save_stmap_exr(stmap, output_path)

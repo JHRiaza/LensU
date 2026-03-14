@@ -8,7 +8,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from calibration import detect_checkerboard
+try:
+    from .calibration import detect_checkerboard
+except ImportError:
+    from calibration import detect_checkerboard
 
 
 def _laplacian_variance(image: np.ndarray) -> float:

@@ -4,13 +4,22 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 
-from calibration import LensProfile, lens_profile_from_dict
+try:
+    from .calibration import LensProfile, lens_profile_from_dict
+except ImportError:
+    from calibration import LensProfile, lens_profile_from_dict
 
 
 LIBRARY_DIR = Path.home() / ".lensu" / "library"
+
+if __name__ == "lens_library":
+    sys.modules.setdefault("src.lens_library", sys.modules[__name__])
+elif __name__ == "src.lens_library":
+    sys.modules.setdefault("lens_library", sys.modules[__name__])
 
 
 def _sanitize_name(name: str) -> str:

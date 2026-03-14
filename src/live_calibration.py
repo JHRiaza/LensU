@@ -11,15 +11,30 @@ import cv2
 import numpy as np
 import streamlit as st
 
-from calibration import (
-    CalibrationDiagnostics,
-    CalibrationPoint,
-    accuracy_grade,
-    calibrate_anamorphic_detailed,
-    calibrate_from_charuco_images,
-    calibrate_from_images,
-    compute_coverage_heatmap,
-)
+try:
+    from .calibration import (
+        CalibrationImageResult,
+        CalibrationDiagnostics,
+        CalibrationPoint,
+        accuracy_grade,
+        calibrate_anamorphic_detailed,
+        calibrate_fisheye,
+        calibrate_from_charuco_images,
+        calibrate_from_images,
+        compute_coverage_heatmap,
+    )
+except ImportError:
+    from calibration import (
+        CalibrationImageResult,
+        CalibrationDiagnostics,
+        CalibrationPoint,
+        accuracy_grade,
+        calibrate_anamorphic_detailed,
+        calibrate_fisheye,
+        calibrate_from_charuco_images,
+        calibrate_from_images,
+        compute_coverage_heatmap,
+    )
 
 
 def _state() -> dict[str, Any]:
@@ -63,7 +78,10 @@ def _decode_uploaded(uploaded_file: Any) -> np.ndarray | None:
 
 
 def _detect_frame(image: np.ndarray, mode: str, settings: dict[str, Any]) -> tuple[bool, np.ndarray, np.ndarray | None]:
-    from calibration import detect_charuco, detect_checkerboard
+    try:
+        from .calibration import detect_charuco, detect_checkerboard
+    except ImportError:
+        from calibration import detect_charuco, detect_checkerboard
 
     if mode == "ChArUco":
         found, _, _, overlay = detect_charuco(
@@ -97,10 +115,32 @@ def _calibrate_captures(
 ) -> tuple[CalibrationPoint | None, CalibrationDiagnostics]:
     with tempfile.TemporaryDirectory() as tmpdir:
         paths: list[Path] = []
+        first_image_size: tuple[int, int] | None = None
         for index, capture in enumerate(captures):
             path = Path(tmpdir) / f"live_{index:03d}.png"
             path.write_bytes(capture["bytes"])
+            if first_image_size is None:
+                image = cv2.imdecode(np.frombuffer(capture["bytes"], dtype=np.uint8), cv2.IMREAD_COLOR)
+                if image is not None:
+                    first_image_size = (image.shape[1], image.shape[0])
             paths.append(path)
+        if settings.get("fisheye_enabled"):
+            point, used_flags = calibrate_fisheye(
+                paths,
+                pattern_size=settings["checkerboard_pattern"],
+                square_size_mm=settings["checker_square_mm"],
+                focal_length_mm=focal_length_mm,
+            )
+            diagnostics = CalibrationDiagnostics(image_size=first_image_size)
+            diagnostics.image_results = [
+                CalibrationImageResult(
+                    image_name=capture["name"],
+                    used=used,
+                    detection_mode="Fisheye Checkerboard",
+                )
+                for capture, used in zip(captures, used_flags)
+            ]
+            return point, diagnostics
         if settings.get("anamorphic_enabled") and mode != "ChArUco":
             point, diagnostics, _ = calibrate_anamorphic_detailed(
                 paths,

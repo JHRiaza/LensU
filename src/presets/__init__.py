@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from calibration import LensProfile, lens_profile_from_dict
+try:
+    from ..calibration import LensProfile, lens_profile_from_dict
+except ImportError:
+    from calibration import LensProfile, lens_profile_from_dict
 
 
 PRESET_DIR = Path(__file__).resolve().parent
@@ -43,4 +46,3 @@ def load_preset(name: str) -> LensProfile:
         data = json.loads(path.read_text(encoding="utf-8"))
         return lens_profile_from_dict(data)
     raise FileNotFoundError(f"Preset not found: {name}")
-

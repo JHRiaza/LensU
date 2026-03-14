@@ -6,8 +6,12 @@ import json
 from pathlib import Path
 from typing import Literal, Optional
 
-from calibration import LENSU_VERSION, LensProfile, measured_focal_length_mm, normalized_focal_lengths
-from stmap import generate_stmap_from_calibration
+try:
+    from .calibration import LENSU_VERSION, LensProfile, measured_focal_length_mm, normalized_focal_lengths
+    from .stmap import generate_stmap_from_calibration
+except ImportError:
+    from calibration import LENSU_VERSION, LensProfile, measured_focal_length_mm, normalized_focal_lengths
+    from stmap import generate_stmap_from_calibration
 
 
 DataMode = Literal["Parameters", "STMap"]
@@ -98,7 +102,11 @@ def export_ue_json(
             }
         )
 
-        if data_mode == "STMap" or include_stmaps:
+        if point.is_fisheye and data_mode != "STMap":
+            data_mode = "STMap"
+            ue_data["data_mode"] = "STMap"
+
+        if data_mode == "STMap" or include_stmaps or point.is_fisheye:
             stmap_name = f"{_safe_name(profile.lens_name)}_{zoom:.1f}mm_stmap.exr"
             stmap_path = generate_stmap_from_calibration(
                 point,
@@ -112,6 +120,7 @@ def export_ue_json(
                     "st_map_info": {
                         "distortion_map": stmap_path.name,
                         "map_format": "RGBA",
+                        "projection_model": "equidistant" if point.is_fisheye else "brown-conrady",
                     },
                 }
             )

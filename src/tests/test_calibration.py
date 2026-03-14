@@ -52,6 +52,17 @@ class CalibrationTests(unittest.TestCase):
         self.assertEqual(info.squeeze_ratio, 2.0)
         self.assertFalse(info.desqueeze_applied)
 
+    def test_fisheye_fields_roundtrip(self):
+        point = CalibrationPoint(
+            focal_length_mm=14.0,
+            is_fisheye=True,
+            fisheye_coeffs=[0.1, -0.01, 0.001, 0.0],
+        )
+        profile = LensProfile(lens_name="Fisheye Test")
+        profile.add_calibration(point)
+        self.assertTrue(profile.calibration_points[0].is_fisheye)
+        self.assertEqual(profile.calibration_points[0].fisheye_coeffs[0], 0.1)
+
 
 if __name__ == "__main__":
     unittest.main()

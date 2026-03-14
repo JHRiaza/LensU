@@ -11,12 +11,20 @@ from typing import Iterable
 import cv2
 import numpy as np
 
-from calibration import (
-    CalibrationPoint,
-    LensProfile,
-    accuracy_grade,
-    generate_distortion_grid,
-)
+try:
+    from .calibration import (
+        CalibrationPoint,
+        LensProfile,
+        accuracy_grade,
+        generate_distortion_grid,
+    )
+except ImportError:
+    from calibration import (
+        CalibrationPoint,
+        LensProfile,
+        accuracy_grade,
+        generate_distortion_grid,
+    )
 
 try:
     import matplotlib

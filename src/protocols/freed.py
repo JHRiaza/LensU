@@ -8,7 +8,12 @@ import threading
 from dataclasses import dataclass
 from typing import Callable
 
-from calibration import LensProfile
+try:
+    from ..calibration import LensProfile
+    from ..encoder_mapping import EncoderMapping, create_mapping_from_samples
+except ImportError:
+    from calibration import LensProfile
+    from encoder_mapping import EncoderMapping, create_mapping_from_samples
 
 
 MAX_24BIT = float((1 << 24) - 1)
@@ -106,34 +111,28 @@ def start_freed_listener(
     return sock
 
 
-def _interpolate_mapping(entries: list[dict[str, float]], encoder_value: int) -> float:
-    ordered = sorted(entries, key=lambda item: float(item["encoder"]))
-    if not ordered:
-        return float(encoder_value) / MAX_24BIT
-    if encoder_value <= ordered[0]["encoder"]:
-        return float(ordered[0]["value"])
-    if encoder_value >= ordered[-1]["encoder"]:
-        return float(ordered[-1]["value"])
-
-    for left, right in zip(ordered, ordered[1:]):
-        left_encoder = float(left["encoder"])
-        right_encoder = float(right["encoder"])
-        if left_encoder <= encoder_value <= right_encoder:
-            span = max(right_encoder - left_encoder, 1.0)
-            alpha = (float(encoder_value) - left_encoder) / span
-            return float(left["value"]) + alpha * (float(right["value"]) - float(left["value"]))
-    return float(encoder_value) / MAX_24BIT
+def _mapping_from_profile(lens_profile: LensProfile) -> EncoderMapping:
+    mappings = lens_profile.encoder_mappings or {}
+    return EncoderMapping(
+        lens_name=lens_profile.lens_name,
+        focus_map=create_mapping_from_samples(
+            [(int(item["encoder"]), float(item["value"])) for item in mappings.get("focus", [])]
+        ),
+        zoom_map=create_mapping_from_samples(
+            [(int(item["encoder"]), float(item["value"])) for item in mappings.get("zoom", [])]
+        ),
+        iris_map=create_mapping_from_samples(
+            [(int(item["encoder"]), float(item["value"])) for item in mappings.get("iris", [])]
+        ),
+    )
 
 
 def freed_to_fiz(packet: FreeDPacket, lens_profile: LensProfile) -> dict:
     """Map raw FreeD encoder values to calibrated FIZ values."""
 
-    mappings = lens_profile.encoder_mappings or {}
-    focus_map = mappings.get("focus", [])
-    iris_map = mappings.get("iris", [])
-    zoom_map = mappings.get("zoom", [])
+    mapping = _mapping_from_profile(lens_profile)
 
-    if not zoom_map and lens_profile.calibration_points:
+    if not mapping.zoom_map and lens_profile.calibration_points:
         ordered_points = sorted(lens_profile.calibration_points, key=lambda item: item.focal_length_mm)
         if len(ordered_points) == 1:
             zoom_mm = float(ordered_points[0].focal_length_mm)
@@ -143,10 +142,10 @@ def freed_to_fiz(packet: FreeDPacket, lens_profile: LensProfile) -> dict:
                 float(ordered_points[-1].focal_length_mm) - float(ordered_points[0].focal_length_mm)
             )
     else:
-        zoom_mm = _interpolate_mapping(zoom_map, packet.zoom)
+        zoom_mm = mapping.encoder_to_zoom(packet.zoom)
 
     return {
-        "focus_m": _interpolate_mapping(focus_map, packet.focus),
-        "iris": _interpolate_mapping(iris_map, packet.focus) if iris_map else 0.0,
+        "focus_m": mapping.encoder_to_focus(packet.focus),
+        "iris": mapping.encoder_to_iris(packet.focus) if mapping.iris_map else 0.0,
         "zoom_mm": zoom_mm,
     }

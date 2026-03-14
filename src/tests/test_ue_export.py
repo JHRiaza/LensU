@@ -46,6 +46,23 @@ class UEExportTests(unittest.TestCase):
         self.assertIn("create_lens_file", script)
         self.assertIn("UE_Test_Lens", script)
 
+    def test_fisheye_forces_stmap_mode(self):
+        profile = LensProfile(lens_name="UE Fisheye Lens", image_width=1920, image_height=1080)
+        profile.add_calibration(
+            CalibrationPoint(
+                focal_length_mm=14.0,
+                fx=800.0,
+                fy=800.0,
+                is_fisheye=True,
+                fisheye_coeffs=[0.01, -0.001, 0.0001, 0.0],
+            )
+        )
+        with workspace_tempdir() as tmpdir:
+            json_path = export_ue_json(profile, tmpdir, data_mode="Parameters")
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["data_mode"], "STMap")
+        self.assertEqual(payload["st_map_table"][0]["st_map_info"]["projection_model"], "equidistant")
+
 
 if __name__ == "__main__":
     unittest.main()

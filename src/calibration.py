@@ -12,8 +12,12 @@ from typing import Optional
 import cv2
 import numpy as np
 
+try:
+    from . import __version__
+except ImportError:
+    __version__ = "1.5.0"
 
-LENSU_VERSION = "v1.3"
+LENSU_VERSION = __version__
 
 
 @dataclass
@@ -33,6 +37,8 @@ class CalibrationPoint:
     rms_error: float = 0.0
     num_images: int = 0
     detection_mode: str = "Checkerboard"
+    is_fisheye: bool = False
+    fisheye_coeffs: list[float] = field(default_factory=list)
     anamorphic_desqueezed: Optional[dict[str, float]] = None
     anamorphic_squeezed: Optional[dict[str, float]] = None
 
@@ -401,6 +407,36 @@ def _build_calibration_point(
     )
 
 
+def _build_fisheye_calibration_point(
+    focal_length_mm: float,
+    rms: float,
+    camera_matrix: np.ndarray,
+    dist_coeffs: np.ndarray,
+    image_size: tuple[int, int],
+    num_images: int,
+) -> CalibrationPoint:
+    width, height = image_size
+    coeffs = np.asarray(dist_coeffs, dtype=np.float64).reshape(-1)
+    padded = list(coeffs[:4]) + [0.0] * max(0, 4 - len(coeffs))
+    return CalibrationPoint(
+        focal_length_mm=focal_length_mm,
+        k1=float(padded[0]),
+        k2=float(padded[1]),
+        p1=0.0,
+        p2=0.0,
+        k3=float(padded[2]),
+        cx=float(camera_matrix[0, 2] / width),
+        cy=float(camera_matrix[1, 2] / height),
+        fx=float(camera_matrix[0, 0]),
+        fy=float(camera_matrix[1, 1]),
+        rms_error=float(rms),
+        num_images=num_images,
+        detection_mode="Fisheye Checkerboard",
+        is_fisheye=True,
+        fisheye_coeffs=[float(value) for value in padded],
+    )
+
+
 def _project_error(
     object_points: np.ndarray,
     image_points: np.ndarray,
@@ -481,6 +517,70 @@ def calibrate_from_images(
         num_images=len(obj_points),
     )
     return point, diagnostics
+
+
+def calibrate_fisheye(
+    image_paths: list[Path],
+    pattern_size: tuple[int, int] = (9, 6),
+    square_size_mm: float = 25.0,
+    focal_length_mm: float = 14.0,
+) -> tuple[Optional[CalibrationPoint], list[bool]]:
+    """Calibrate a fisheye/ultra-wide lens using OpenCV's equidistant model."""
+
+    objp = _create_checkerboard_object_points(pattern_size, square_size_mm)
+    obj_points: list[np.ndarray] = []
+    img_points: list[np.ndarray] = []
+    used_flags: list[bool] = []
+    image_size: tuple[int, int] | None = None
+
+    for path in image_paths:
+        image = _decode_image(path)
+        if image is None:
+            used_flags.append(False)
+            continue
+        image_size = image_size or (image.shape[1], image.shape[0])
+        found, corners, _ = detect_checkerboard(image, pattern_size)
+        used = bool(found and corners is not None)
+        used_flags.append(used)
+        if not used:
+            continue
+        obj_points.append(objp.reshape(1, -1, 3).astype(np.float64))
+        img_points.append(corners.reshape(1, -1, 2).astype(np.float64))
+
+    if len(obj_points) < 3 or image_size is None:
+        return None, used_flags
+
+    camera_matrix = np.eye(3, dtype=np.float64)
+    dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+    flags = (
+        cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC
+        | cv2.fisheye.CALIB_CHECK_COND
+        | cv2.fisheye.CALIB_FIX_SKEW
+    )
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-6)
+
+    try:
+        rms, camera_matrix, dist_coeffs, _, _ = cv2.fisheye.calibrate(
+            obj_points,
+            img_points,
+            image_size,
+            camera_matrix,
+            dist_coeffs,
+            flags=flags,
+            criteria=criteria,
+        )
+    except cv2.error:
+        return None, used_flags
+
+    point = _build_fisheye_calibration_point(
+        focal_length_mm=focal_length_mm,
+        rms=rms,
+        camera_matrix=camera_matrix,
+        dist_coeffs=dist_coeffs,
+        image_size=image_size,
+        num_images=len(obj_points),
+    )
+    return point, used_flags
 
 
 def calibrate_anamorphic_detailed(
@@ -677,6 +777,9 @@ def reconstruct_camera_matrix(point: CalibrationPoint, image_size: tuple[int, in
 def reconstruct_dist_coeffs(point: CalibrationPoint) -> np.ndarray:
     """Reconstruct Brown-Conrady coefficients from a calibration point."""
 
+    if point.is_fisheye:
+        coeffs = point.fisheye_coeffs or [point.k1, point.k2, point.k3, 0.0]
+        return np.asarray(coeffs[:4], dtype=np.float32).reshape(4, 1)
     return np.array([[point.k1, point.k2, point.p1, point.p2, point.k3]], dtype=np.float32)
 
 
@@ -715,6 +818,8 @@ def undistort_image(
 
     camera_matrix = reconstruct_camera_matrix(point, image_size)
     dist_coeffs = reconstruct_dist_coeffs(point)
+    if point.is_fisheye:
+        return cv2.fisheye.undistortImage(image, camera_matrix, dist_coeffs, Knew=camera_matrix)
     return cv2.undistort(image, camera_matrix, dist_coeffs)
 
 
@@ -739,7 +844,10 @@ def distort_points(
 
     rvec = np.zeros((3, 1), dtype=np.float32)
     tvec = np.zeros((3, 1), dtype=np.float32)
-    projected, _ = cv2.projectPoints(normalized, rvec, tvec, camera_matrix, dist_coeffs)
+    if point.is_fisheye:
+        projected, _ = cv2.fisheye.projectPoints(normalized, rvec, tvec, camera_matrix, dist_coeffs)
+    else:
+        projected, _ = cv2.projectPoints(normalized, rvec, tvec, camera_matrix, dist_coeffs)
     return projected.reshape(-1, 2)
 
 

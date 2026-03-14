@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import queue
+import sys
 import tempfile
 import time
 import zipfile
@@ -16,47 +18,94 @@ import numpy as np
 import streamlit as st
 import streamlit.components.v1 as components
 
-from board_generator import generate_charuco_pdf, generate_checkerboard_pdf
-from batch import BatchFolderResult, batch_calibrate_detailed
-from calibration import (
-    AnamorphicInfo,
-    BreathingPoint,
-    CalibrationDiagnostics,
-    CalibrationPoint,
-    LensProfile,
-    NodalOffset,
-    accuracy_grade,
-    aruco_available,
-    calibrate_anamorphic_detailed,
-    calibrate_from_charuco_images,
-    calibrate_from_images,
-    compute_coverage_heatmap,
-    detect_charuco,
-    detect_checkerboard,
-    estimate_nodal_from_parallax,
-    generate_barrel_pincushion_visualization,
-    generate_distortion_grid,
-    lens_profile_from_dict,
-    measured_focal_length_mm,
-    undistort_image,
-)
-from lens_library import (
-    delete_from_library,
-    list_library,
-    load_from_library,
-    save_to_library,
-    search_library,
-)
-from live_calibration import live_calibration_ui
-from presets import list_presets, load_preset
-from protocols.freed import FreeDPacket, freed_to_fiz, start_freed_listener
-from protocols.opentrackio import OpenTrackIOSample, start_opentrackio_listener
-from report import generate_calibration_report, generate_comparison_report
-from ue_export import export_ue_json, export_ue_python_script
-from video_extractor import extract_frames_from_video, extract_frames_with_checkerboard
+try:
+    from . import __version__
+    from .board_generator import generate_charuco_pdf, generate_checkerboard_pdf
+    from .batch import BatchFolderResult, batch_calibrate_detailed
+    from .calibration import (
+        AnamorphicInfo,
+        BreathingPoint,
+        CalibrationDiagnostics,
+        CalibrationImageResult,
+        CalibrationPoint,
+        LensProfile,
+        NodalOffset,
+        accuracy_grade,
+        aruco_available,
+        calibrate_anamorphic_detailed,
+        calibrate_fisheye,
+        calibrate_from_charuco_images,
+        calibrate_from_images,
+        compute_coverage_heatmap,
+        detect_charuco,
+        detect_checkerboard,
+        estimate_nodal_from_parallax,
+        generate_barrel_pincushion_visualization,
+        generate_distortion_grid,
+        lens_profile_from_dict,
+        measured_focal_length_mm,
+        undistort_image,
+    )
+    from .encoder_mapping import create_mapping_from_samples
+    from .lens_library import (
+        delete_from_library,
+        list_library,
+        load_from_library,
+        save_to_library,
+        search_library,
+    )
+    from .live_calibration import live_calibration_ui
+    from .presets import list_presets, load_preset
+    from .protocols.freed import FreeDPacket, freed_to_fiz, start_freed_listener
+    from .protocols.opentrackio import OpenTrackIOSample, map_opentrackio_fiz, start_opentrackio_listener
+    from .report import generate_calibration_report, generate_comparison_report
+    from .ue_export import export_ue_json, export_ue_python_script
+    from .video_extractor import extract_frames_from_video, extract_frames_with_checkerboard
+except ImportError:
+    from board_generator import generate_charuco_pdf, generate_checkerboard_pdf
+    from batch import BatchFolderResult, batch_calibrate_detailed
+    from calibration import (
+        AnamorphicInfo,
+        BreathingPoint,
+        CalibrationDiagnostics,
+        CalibrationImageResult,
+        CalibrationPoint,
+        LensProfile,
+        NodalOffset,
+        accuracy_grade,
+        aruco_available,
+        calibrate_anamorphic_detailed,
+        calibrate_fisheye,
+        calibrate_from_charuco_images,
+        calibrate_from_images,
+        compute_coverage_heatmap,
+        detect_charuco,
+        detect_checkerboard,
+        estimate_nodal_from_parallax,
+        generate_barrel_pincushion_visualization,
+        generate_distortion_grid,
+        lens_profile_from_dict,
+        measured_focal_length_mm,
+        undistort_image,
+    )
+    from encoder_mapping import create_mapping_from_samples
+    from lens_library import (
+        delete_from_library,
+        list_library,
+        load_from_library,
+        save_to_library,
+        search_library,
+    )
+    from live_calibration import live_calibration_ui
+    from presets import list_presets, load_preset
+    from protocols.freed import FreeDPacket, freed_to_fiz, start_freed_listener
+    from protocols.opentrackio import OpenTrackIOSample, map_opentrackio_fiz, start_opentrackio_listener
+    from report import generate_calibration_report, generate_comparison_report
+    from ue_export import export_ue_json, export_ue_python_script
+    from video_extractor import extract_frames_from_video, extract_frames_with_checkerboard
 
 
-APP_VERSION = "v1.3"
+APP_VERSION = f"v{__version__}" if "__version__" in globals() else "v1.5.0"
 PROFILE_STATE_PATH = Path.home() / ".lensu" / "current_profile.json"
 
 st.set_page_config(page_title="LensU", page_icon="L", layout="wide")
@@ -177,7 +226,8 @@ def _tracking_row_from_freed(packet: FreeDPacket, profile: LensProfile) -> dict[
     }
 
 
-def _tracking_row_from_opentrackio(sample: OpenTrackIOSample) -> dict[str, Any]:
+def _tracking_row_from_opentrackio(sample: OpenTrackIOSample, profile: LensProfile) -> dict[str, Any]:
+    fiz = map_opentrackio_fiz(sample, profile)
     return {
         "timestamp": sample.timestamp,
         "protocol": "OpenTrackIO",
@@ -188,11 +238,11 @@ def _tracking_row_from_opentrackio(sample: OpenTrackIOSample) -> dict[str, Any]:
         "pos_x_mm": round(float(sample.translation[0]) * 1000.0, 3),
         "pos_y_mm": round(float(sample.translation[1]) * 1000.0, 3),
         "pos_z_mm": round(float(sample.translation[2]) * 1000.0, 3),
-        "zoom_raw": "",
-        "focus_raw": "",
-        "zoom_mm": round(float(sample.focal_length_mm), 4),
-        "focus_m": round(float(sample.focus_distance_m), 4),
-        "iris": round(float(sample.iris_fstop), 4),
+        "zoom_raw": sample.zoom_encoder if sample.zoom_encoder is not None else "",
+        "focus_raw": sample.focus_encoder if sample.focus_encoder is not None else "",
+        "zoom_mm": round(float(fiz["zoom_mm"]), 4),
+        "focus_m": round(float(fiz["focus_m"]), 4),
+        "iris": round(float(fiz["iris"]), 4),
     }
 
 
@@ -208,7 +258,7 @@ def _drain_tracking_queue(profile: LensProfile) -> None:
         if isinstance(sample, FreeDPacket):
             row = _tracking_row_from_freed(sample, profile)
         elif isinstance(sample, OpenTrackIOSample):
-            row = _tracking_row_from_opentrackio(sample)
+            row = _tracking_row_from_opentrackio(sample, profile)
         else:
             continue
 
@@ -388,6 +438,7 @@ def _calibrate_files(
     charuco_marker_mm: float,
     charuco_dictionary: int,
     anamorphic_enabled: bool = False,
+    fisheye_enabled: bool = False,
     squeeze_ratio: float = 2.0,
     anamorphic_desqueezed: bool = False,
     excluded_names: set[str] | None = None,
@@ -396,6 +447,7 @@ def _calibrate_files(
     file_payloads: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory() as tmpdir:
         image_paths: list[Path] = []
+        first_image_size: tuple[int, int] | None = None
         for uploaded in uploaded_files:
             file_bytes = uploaded.getvalue()
             if uploaded.name in excluded_names:
@@ -403,10 +455,31 @@ def _calibrate_files(
                 continue
             path = Path(tmpdir) / uploaded.name
             path.write_bytes(file_bytes)
+            if first_image_size is None:
+                preview = _bytes_to_image(file_bytes)
+                if preview is not None:
+                    first_image_size = (preview.shape[1], preview.shape[0])
             image_paths.append(path)
             file_payloads.append({"name": uploaded.name, "bytes": file_bytes, "excluded": False})
 
-        if anamorphic_enabled and mode == "ChArUco":
+        if fisheye_enabled:
+            point, used_flags = calibrate_fisheye(
+                image_paths,
+                pattern_size=checkerboard_pattern,
+                square_size_mm=checker_square_mm,
+                focal_length_mm=focal_length,
+            )
+            diagnostics = CalibrationDiagnostics(image_size=None)
+            diagnostics.image_size = first_image_size
+            diagnostics.image_results = [
+                CalibrationImageResult(
+                    image_name=path.name,
+                    used=used,
+                    detection_mode="Fisheye Checkerboard",
+                )
+                for path, used in zip(image_paths, used_flags)
+            ]
+        elif anamorphic_enabled and mode == "ChArUco":
             point, diagnostics = _calibrate_charuco_anamorphic(
                 image_paths=image_paths,
                 board_size=charuco_board_size,
@@ -757,6 +830,7 @@ def _render_calibration_visuals(run: dict[str, Any]) -> None:
                     charuco_marker_mm=settings["charuco_marker_mm"],
                     charuco_dictionary=settings["charuco_dictionary"],
                     anamorphic_enabled=settings["anamorphic_enabled"],
+                    fisheye_enabled=settings["fisheye_enabled"],
                     squeeze_ratio=settings["squeeze_ratio"],
                     anamorphic_desqueezed=settings["anamorphic_desqueezed"],
                 )
@@ -897,15 +971,17 @@ def _prepare_export_bundle(profile: LensProfile, data_mode: str, include_stmaps:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
         stmap_dir = tmp_path / "stmaps"
-        package_stmaps = include_stmaps or data_mode == "STMap"
+        has_fisheye = any(point.is_fisheye for point in profile.calibration_points)
+        effective_mode = "STMap" if has_fisheye else data_mode
+        package_stmaps = include_stmaps or effective_mode == "STMap"
         json_path = export_ue_json(
             profile,
             tmp_path,
-            data_mode=data_mode,
+            data_mode=effective_mode,
             stmap_directory=stmap_dir,
             include_stmaps=package_stmaps,
         )
-        script_path = export_ue_python_script(profile, json_path.name, tmp_path, data_mode=data_mode)
+        script_path = export_ue_python_script(profile, json_path.name, tmp_path, data_mode=effective_mode)
 
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -916,7 +992,7 @@ def _prepare_export_bundle(profile: LensProfile, data_mode: str, include_stmaps:
                     archive.write(stmap_file, f"stmaps/{stmap_file.name}")
         zip_bytes = zip_buffer.getvalue()
         return {
-            "name": f"LensU_{profile.lens_name.replace(' ', '_')}_{data_mode}.zip",
+            "name": f"LensU_{profile.lens_name.replace(' ', '_')}_{effective_mode}.zip",
             "bytes": zip_bytes,
             "zip_size": len(zip_bytes),
             "json_text": json_path.read_text(encoding="utf-8"),
@@ -958,6 +1034,69 @@ def _library_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "date_min": min(dates) if dates else "-",
         "date_max": max(dates) if dates else "-",
     }
+
+
+def _mapping_rows(profile: LensProfile, mapping_type: str) -> list[dict[str, float]]:
+    rows = profile.encoder_mappings.get(mapping_type, []) if profile.encoder_mappings else []
+    return [
+        {"encoder": int(item.get("encoder", 0)), "value": float(item.get("value", 0.0))}
+        for item in rows
+    ]
+
+
+def _save_mapping_rows(profile: LensProfile, mapping_type: str, rows: list[dict[str, Any]]) -> None:
+    samples = [(int(row["encoder"]), float(row["value"])) for row in rows if str(row.get("encoder", "")).strip()]
+    ordered = create_mapping_from_samples(samples)
+    if not profile.encoder_mappings:
+        profile.encoder_mappings = {}
+    profile.encoder_mappings[mapping_type] = [
+        {"encoder": int(encoder), "value": float(value)} for encoder, value in ordered
+    ]
+
+
+def _render_encoder_mapping_editor(profile: LensProfile) -> None:
+    st.subheader("Encoder Mapping")
+    st.caption(
+        "Enter measured calibration pairs to map raw encoder values 0-65535 to physical focus distance, focal length, and T-stop."
+    )
+
+    for mapping_type, label in (
+        ("focus", "Focus Distance (m)"),
+        ("zoom", "Focal Length (mm)"),
+        ("iris", "T-Stop"),
+    ):
+        st.markdown(f"**{mapping_type.title()} Map**")
+        seed_rows = _mapping_rows(profile, mapping_type) or [
+            {"encoder": 0, "value": 0.0},
+            {"encoder": 65535, "value": 0.0},
+        ]
+        edited = st.data_editor(
+            seed_rows,
+            num_rows="dynamic",
+            use_container_width=True,
+            key=f"encoder_map_{mapping_type}",
+            column_config={
+                "encoder": st.column_config.NumberColumn("Encoder", min_value=0, max_value=65535, step=1),
+                "value": st.column_config.NumberColumn(label, step=0.01),
+            },
+        )
+        cleaned = [
+            {"encoder": int(row["encoder"]), "value": float(row["value"])}
+            for row in edited
+            if row.get("encoder") is not None and row.get("value") is not None
+        ]
+        _save_mapping_rows(profile, mapping_type, cleaned)
+        curve = _mapping_rows(profile, mapping_type)
+        if curve:
+            st.line_chart(
+                [{"encoder": row["encoder"], mapping_type: row["value"]} for row in curve],
+                x="encoder",
+                y=mapping_type,
+            )
+
+    if st.button("Save Encoder Mappings", key="save_encoder_mappings"):
+        _save_profile(profile)
+        st.success(f"Saved encoder mapping set for {profile.lens_name}.")
 
 
 def _render_live_tracking_tab(profile: LensProfile) -> None:
@@ -1035,6 +1174,9 @@ def _render_live_tracking_tab(profile: LensProfile) -> None:
         )
     else:
         st.caption("Current profile has no calibration points. FreeD zoom values fall back to normalized raw encoder data.")
+
+    st.divider()
+    _render_encoder_mapping_editor(profile)
 
     rows = state.get("rows", [])
     if rows:
@@ -1226,6 +1368,15 @@ def main() -> None:
         else:
             profile.anamorphic = None
 
+        st.subheader("Fisheye")
+        fisheye_enabled = st.toggle(
+            "Fisheye Mode",
+            value=any(point.is_fisheye for point in profile.calibration_points),
+            help="Use OpenCV's fisheye equidistant model for ultra-wide and fisheye lenses. Recommended for FOV above 120 degrees.",
+        )
+        if fisheye_enabled:
+            st.info("Fisheye mode uses the equidistant projection model. Unreal export will always include STMaps.")
+
         _render_board_generator_sidebar(dictionary_names)
 
     settings = {
@@ -1236,6 +1387,7 @@ def main() -> None:
         "charuco_marker_mm": float(charuco_marker_mm),
         "charuco_dictionary": int(dictionary_names[charuco_dictionary_name]),
         "anamorphic_enabled": anamorphic_enabled,
+        "fisheye_enabled": fisheye_enabled,
         "squeeze_ratio": float(squeeze_ratio),
         "anamorphic_desqueezed": bool(anamorphic_desqueezed),
     }
@@ -1313,6 +1465,7 @@ def main() -> None:
                     charuco_marker_mm=settings["charuco_marker_mm"],
                     charuco_dictionary=settings["charuco_dictionary"],
                     anamorphic_enabled=settings["anamorphic_enabled"],
+                    fisheye_enabled=settings["fisheye_enabled"],
                     squeeze_ratio=settings["squeeze_ratio"],
                     anamorphic_desqueezed=settings["anamorphic_desqueezed"],
                 )
@@ -1495,6 +1648,7 @@ def main() -> None:
                         charuco_marker_mm=settings["charuco_marker_mm"],
                         charuco_dictionary=settings["charuco_dictionary"],
                         anamorphic_enabled=settings["anamorphic_enabled"],
+                        fisheye_enabled=settings["fisheye_enabled"],
                         squeeze_ratio=settings["squeeze_ratio"],
                         anamorphic_desqueezed=settings["anamorphic_desqueezed"],
                     )
@@ -1570,6 +1724,7 @@ def main() -> None:
                         sensor_height_mm=profile.sensor_height_mm,
                         progress_callback=_progress,
                         anamorphic_enabled=settings["anamorphic_enabled"] and detection_mode.lower() != "charuco",
+                        fisheye_enabled=settings["fisheye_enabled"],
                         squeeze_ratio=settings["squeeze_ratio"],
                         anamorphic_desqueezed=settings["anamorphic_desqueezed"],
                     )
@@ -1633,6 +1788,7 @@ def main() -> None:
                     charuco_marker_mm=settings["charuco_marker_mm"],
                     charuco_dictionary=settings["charuco_dictionary"],
                     anamorphic_enabled=settings["anamorphic_enabled"],
+                    fisheye_enabled=settings["fisheye_enabled"],
                     squeeze_ratio=settings["squeeze_ratio"],
                     anamorphic_desqueezed=settings["anamorphic_desqueezed"],
                 )
@@ -1846,6 +2002,18 @@ def main() -> None:
                         st.caption(
                             f"Focal length in pixels: fx={point.fx:.2f}, fy={point.fy:.2f}. Images used: {point.num_images}."
                         )
+                        if point.is_fisheye:
+                            st.info(
+                                "Fisheye calibration: equidistant projection model with four radial coefficients. Use STMap export for Unreal Engine."
+                            )
+                            st.write(
+                                {
+                                    "k1": round(point.fisheye_coeffs[0], 6) if len(point.fisheye_coeffs) > 0 else 0.0,
+                                    "k2": round(point.fisheye_coeffs[1], 6) if len(point.fisheye_coeffs) > 1 else 0.0,
+                                    "k3": round(point.fisheye_coeffs[2], 6) if len(point.fisheye_coeffs) > 2 else 0.0,
+                                    "k4": round(point.fisheye_coeffs[3], 6) if len(point.fisheye_coeffs) > 3 else 0.0,
+                                }
+                            )
                         if point.anamorphic_desqueezed and point.anamorphic_squeezed:
                             st.dataframe(
                                 [
@@ -2051,17 +2219,23 @@ def main() -> None:
         if not profile.calibration_points:
             st.warning("No calibration data available. Run at least one distortion calibration first.")
         else:
+            has_fisheye = any(point.is_fisheye for point in profile.calibration_points)
             data_mode = st.radio(
                 "UE Data Mode",
                 ["Parameters", "STMap"],
                 horizontal=True,
+                index=1 if has_fisheye else 0,
+                disabled=has_fisheye,
                 help="Parameters exports Brown-Conrady coefficients. STMap exports texture maps and JSON entries for texture-driven distortion.",
             )
             include_stmaps = st.checkbox(
                 "Include STMaps in ZIP",
-                value=data_mode == "STMap",
+                value=data_mode == "STMap" or has_fisheye,
+                disabled=has_fisheye,
                 help="Package generated STMap textures inside the ZIP even when exporting parameter-driven data.",
             )
+            if has_fisheye:
+                st.info("Fisheye calibration points always export as STMaps because Unreal's parametric lens model does not represent the equidistant fisheye projection.")
             st.caption("STMaps are useful for texture-driven workflows or for inspection alongside the parameter fit.")
 
             if st.button("Generate UE Export Package", type="primary"):
@@ -2117,5 +2291,14 @@ def main() -> None:
     _render_footer()
 
 
+def launch() -> None:
+    """Launch the Streamlit app from a console entry point."""
+
+    from streamlit.web import cli as stcli
+
+    sys.argv = ["streamlit", "run", os.path.abspath(__file__)]
+    raise SystemExit(stcli.main())
+
+
 if __name__ == "__main__":
-    main()
+    launch()
