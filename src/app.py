@@ -15,6 +15,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from board_generator import generate_charuco_pdf, generate_checkerboard_pdf
+from batch import BatchFolderResult, batch_calibrate_detailed
 from calibration import (
     BreathingPoint,
     CalibrationDiagnostics,
@@ -34,6 +35,13 @@ from calibration import (
     lens_profile_from_dict,
     measured_focal_length_mm,
     undistort_image,
+)
+from lens_library import (
+    delete_from_library,
+    list_library,
+    load_from_library,
+    save_to_library,
+    search_library,
 )
 from live_calibration import live_calibration_ui
 from ue_export import export_ue_json, export_ue_python_script
@@ -79,6 +87,10 @@ if "board_download" not in st.session_state:
     st.session_state.board_download = None
 if "export_bundle" not in st.session_state:
     st.session_state.export_bundle = None
+if "batch_results" not in st.session_state:
+    st.session_state.batch_results = []
+if "library_export_bundle" not in st.session_state:
+    st.session_state.library_export_bundle = None
 
 
 def _run_key(focal_length_mm: float) -> str:
@@ -607,6 +619,42 @@ def _prepare_export_bundle(profile: LensProfile, data_mode: str, include_stmaps:
         }
 
 
+def _batch_table_rows(results: list[BatchFolderResult]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in results:
+        rows.append(
+            {
+                "focal_length_mm": round(item.focal_length_mm, 3),
+                "folder": item.folder_name,
+                "status": "OK" if item.success else "FAILED",
+                "used_images": item.used_count,
+                "total_images": item.source_count,
+                "rms_error_px": round(item.rms_error, 5) if item.success else None,
+                "error": item.error,
+            }
+        )
+    return rows
+
+
+def _library_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if not rows:
+        return {
+            "total_profiles": 0,
+            "families": 0,
+            "date_min": "-",
+            "date_max": "-",
+        }
+    names = [row.get("name", "Unknown") for row in rows]
+    unique_names = len(set(names))
+    dates = [row.get("date", "") for row in rows if row.get("date")]
+    return {
+        "total_profiles": len(rows),
+        "families": unique_names,
+        "date_min": min(dates) if dates else "-",
+        "date_max": max(dates) if dates else "-",
+    }
+
+
 def main() -> None:
     profile: LensProfile = st.session_state.profile
     _render_header()
@@ -745,14 +793,16 @@ def main() -> None:
         "charuco_dictionary": int(dictionary_names[charuco_dictionary_name]),
     }
 
-    tab_calibrate, tab_live, tab_video, tab_breathing, tab_nodal, tab_profile, tab_export = st.tabs(
+    tab_calibrate, tab_live, tab_video, tab_batch, tab_breathing, tab_nodal, tab_profile, tab_library, tab_export = st.tabs(
         [
             "Distortion Calibration",
             "Live Calibration",
             "Video Calibration",
+            "Batch Calibration",
             "Lens Breathing",
             "Nodal Offset",
             "Lens Profile",
+            "Lens Library",
             "UE Export",
         ]
     )
@@ -996,6 +1046,78 @@ def main() -> None:
             current_video_run = st.session_state.calibration_runs.get(_run_key(float(video_focal_length)))
             if current_video_run:
                 _render_calibration_visuals(current_video_run)
+
+    with tab_batch:
+        st.header("Batch Calibration")
+        st.info(
+            "Calibrate multiple focal lengths from subfolders such as 24mm, 35mm, and 50mm inside one base directory."
+        )
+        batch_base_dir = st.text_input(
+            "Batch Folder Path",
+            value="",
+            help="Example: D:/calibration_shots. Each subfolder should contain one focal length image set.",
+        ).strip()
+        st.text_area(
+            "Folder Structure Notes (optional)",
+            value="",
+            height=90,
+            help="Optional notes only. LensU calibrates from the directory path above.",
+        )
+        if st.button("Run Batch Calibration", type="primary"):
+            if not batch_base_dir:
+                st.error("Enter a valid base folder path.")
+            else:
+                base_dir = Path(batch_base_dir)
+                progress = st.progress(0)
+                status = st.empty()
+
+                def _progress(current: int, total: int, result: BatchFolderResult) -> None:
+                    ratio = current / max(total, 1)
+                    progress.progress(ratio)
+                    state = "OK" if result.success else "FAILED"
+                    status.caption(
+                        f"{current}/{total} | {result.focal_length_mm:.1f}mm | {state} | "
+                        f"used {result.used_count}/{result.source_count}"
+                    )
+
+                try:
+                    batch_pattern = (
+                        settings["charuco_board_size"]
+                        if detection_mode == "ChArUco"
+                        else settings["checkerboard_pattern"]
+                    )
+                    batch_square = (
+                        settings["charuco_square_mm"]
+                        if detection_mode == "ChArUco"
+                        else settings["checker_square_mm"]
+                    )
+                    batch_profile, results = batch_calibrate_detailed(
+                        base_dir=base_dir,
+                        pattern_size=batch_pattern,
+                        square_size_mm=batch_square,
+                        detection_mode=detection_mode.lower(),
+                        sensor_width_mm=profile.sensor_width_mm,
+                        sensor_height_mm=profile.sensor_height_mm,
+                        progress_callback=_progress,
+                    )
+                    st.session_state.batch_results = results
+                    for batch_point in batch_profile.calibration_points:
+                        profile.add_calibration(batch_point)
+                    if batch_profile.calibration_points:
+                        profile.image_width = batch_profile.image_width
+                        profile.image_height = batch_profile.image_height
+                        _save_profile(profile)
+                    success_count = sum(1 for item in results if item.success)
+                    st.success(
+                        f"Batch complete. {success_count}/{len(results)} focal folders calibrated successfully."
+                    )
+                except Exception as exc:
+                    st.error(f"Batch calibration failed: {exc}")
+
+        batch_rows = _batch_table_rows(st.session_state.batch_results)
+        if batch_rows:
+            st.subheader("Batch Summary")
+            st.dataframe(batch_rows, use_container_width=True)
 
     with tab_breathing:
         st.header("Lens Breathing")
@@ -1319,6 +1441,83 @@ def main() -> None:
                 _save_profile(st.session_state.profile)
                 st.success(f"Loaded profile: {st.session_state.profile.lens_name}")
                 st.rerun()
+
+    with tab_library:
+        st.header("Lens Library")
+        st.info("Browse, load, delete, and export profiles stored in your local LensU library.")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            library_search_name = st.text_input("Search Lens Name", value="")
+        with c2:
+            library_search_sensor = st.text_input("Filter Sensor", value="")
+
+        library_rows = search_library(lens_name=library_search_name, sensor_type=library_search_sensor)
+        stats = _library_stats(list_library())
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Total Profiles", str(stats["total_profiles"]))
+        s2.metric("Lens Families", str(stats["families"]))
+        s3.metric("Date Range Start", stats["date_min"])
+        s4.metric("Date Range End", stats["date_max"])
+
+        if st.button("Save Current Profile To Library", key="save_current_profile_library"):
+            saved_path = save_to_library(profile)
+            st.success(f"Saved: {saved_path.name}")
+            st.rerun()
+
+        if not library_rows:
+            st.caption("No profiles found in library with current filters.")
+        else:
+            st.dataframe(library_rows, use_container_width=True)
+            selected_filename = st.selectbox(
+                "Select Library Profile",
+                [row["filename"] for row in library_rows],
+                key="library_selected_filename",
+            )
+            selected_row = next((row for row in library_rows if row["filename"] == selected_filename), None)
+
+            action_cols = st.columns(3)
+            with action_cols[0]:
+                if st.button("Load Into Session", type="primary", key="library_load_button"):
+                    st.session_state.profile = load_from_library(selected_filename)
+                    _save_profile(st.session_state.profile)
+                    st.success(f"Loaded: {selected_filename}")
+                    st.rerun()
+            with action_cols[1]:
+                if st.button("Delete Profile", key="library_delete_button"):
+                    if delete_from_library(selected_filename):
+                        st.success(f"Deleted: {selected_filename}")
+                        st.rerun()
+                    else:
+                        st.error("Could not delete selected library profile.")
+            with action_cols[2]:
+                export_mode = st.selectbox(
+                    "Export Data Mode",
+                    ["Parameters", "STMap"],
+                    key="library_export_mode",
+                )
+                include_stmaps = export_mode == "STMap"
+                if st.button("Export Selected To UE ZIP", key="library_export_button"):
+                    selected_profile = load_from_library(selected_filename)
+                    st.session_state.library_export_bundle = _prepare_export_bundle(
+                        selected_profile, export_mode, include_stmaps
+                    )
+
+            library_bundle = st.session_state.library_export_bundle
+            if library_bundle:
+                st.download_button(
+                    "Download Selected UE Export",
+                    data=library_bundle["bytes"],
+                    file_name=library_bundle["name"],
+                    mime="application/zip",
+                    key="library_export_download",
+                )
+
+            if selected_row is not None:
+                st.caption(
+                    f"Selected: {selected_row['name']} | Sensor {selected_row['sensor']} | "
+                    f"Focals {selected_row['focal_lengths']} | RMS avg {selected_row['rms_avg']:.4f}"
+                )
 
     with tab_export:
         st.header("Export to Unreal Engine")
