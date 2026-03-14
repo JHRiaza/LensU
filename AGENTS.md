@@ -1,182 +1,169 @@
-# AGENTS.md — LensU Sprint 4: Batch Processing + Lens Library + CLI
+# AGENTS.md — LensU Sprint 5: Anamorphic Lens Support + Comparison Reports + README
 
 ## Goal
-Make LensU production-ready for VP stages: batch calibration, reusable lens library, and a CLI for automated pipelines.
+Add anamorphic lens calibration (huge gap in the market), professional comparison reports, and a polished README for release.
 
 ## Tasks
 
-### 1. Lens Library (NEW: src/lens_library.py)
+### 1. Anamorphic Lens Support (calibration.py + app.py)
 
-A local database of calibrated lens profiles that users can save, browse, and reuse:
+Anamorphic lenses have different horizontal and vertical squeeze ratios (typically 2x, 1.5x, 1.33x). This means distortion is asymmetric — standard calibration needs adaptation.
 
+Add to calibration.py:
 ```python
-from pathlib import Path
-import json
+@dataclass
+class AnamorphicInfo:
+    """Anamorphic lens parameters."""
+    squeeze_ratio: float = 2.0  # 2x, 1.5x, 1.33x
+    desqueeze_applied: bool = False  # whether input images are already desqueezed
 
-LIBRARY_DIR = Path.home() / ".lensu" / "library"
-
-def save_to_library(profile: LensProfile) -> Path:
-    """Save a calibrated lens profile to the local library.
-    Creates: ~/.lensu/library/{lens_name}_{date}.json
-    """
-
-def list_library() -> list[dict]:
-    """List all saved profiles with summary info.
-    Returns: [{name, date, focal_lengths, sensor, rms_avg}, ...]
-    """
-
-def load_from_library(filename: str) -> LensProfile:
-    """Load a profile from the library."""
-
-def delete_from_library(filename: str) -> bool:
-    """Delete a profile from the library."""
-
-def search_library(lens_name: str = "", sensor_type: str = "") -> list[dict]:
-    """Search library by lens name or sensor type."""
-```
-
-Add a "Lens Library" tab in Streamlit:
-- Browse saved profiles with search/filter
-- Load a profile into the current session
-- Delete old profiles
-- Export any library profile as UE package
-- Show statistics: total profiles, lens families, date range
-
-### 2. Batch Calibration (NEW: src/batch.py)
-
-For calibrating multiple focal lengths in one go from organized folders:
-
-```python
-def batch_calibrate(
-    base_dir: Path,
+def calibrate_anamorphic(
+    image_paths: list[Path],
     pattern_size: tuple[int, int] = (9, 6),
     square_size_mm: float = 25.0,
-    detection_mode: str = "checkerboard",  # or "charuco"
-    sensor_width_mm: float = 36.0,
-    sensor_height_mm: float = 24.0,
-) -> LensProfile:
-    """Batch calibrate from a folder structure:
+    focal_length_mm: float = 50.0,
+    squeeze_ratio: float = 2.0,
+    desqueezed: bool = False,
+) -> tuple[Optional[CalibrationPoint], list[bool]]:
+    """Calibrate an anamorphic lens.
     
-    base_dir/
-      24mm/
-        img001.jpg
-        img002.jpg
-        ...
-      35mm/
-        img001.jpg
-        ...
-      50mm/
-        ...
+    If images are NOT desqueezed (raw anamorphic):
+      1. Desqueeze images by scaling horizontally by squeeze_ratio
+      2. Run standard calibration on desqueezed images
+      3. Store both squeezed and desqueezed parameters
     
-    Each subfolder name must contain the focal length in mm (e.g., "24mm", "24", "FL24").
-    Extracts the number, calibrates each folder, builds a complete LensProfile.
+    If images ARE already desqueezed:
+      1. Run standard calibration directly
+      2. Calculate squeezed parameters by reversing the desqueeze
     
-    Returns a LensProfile with all focal lengths calibrated.
-    """
-
-def batch_calibrate_from_videos(
-    base_dir: Path,
-    pattern_size: tuple[int, int] = (9, 6),
-    square_size_mm: float = 25.0,
-    max_frames_per_video: int = 30,
-    **kwargs,
-) -> LensProfile:
-    """Same as batch_calibrate but each subfolder contains a video file
-    instead of images. Extracts frames automatically.
-    
-    base_dir/
-      24mm/
-        calibration.mp4
-      50mm/
-        calibration.mov
+    The resulting CalibrationPoint stores the desqueezed parameters
+    (what UE needs for the CG render).
     """
 ```
 
-Add batch calibration to Streamlit:
-- Folder path input (or drag-drop folder structure description)
-- Progress bar showing calibration progress per focal length
-- Summary table with all results at the end
-
-### 3. CLI Interface (NEW: src/cli.py)
-
-Command-line interface for automated pipelines (no browser needed):
-
+Add AnamorphicInfo to LensProfile:
 ```python
-# Usage:
-# python -m lensu calibrate --images ./photos/50mm/ --focal-length 50 --sensor full-frame
-# python -m lensu batch --dir ./calibration_shots/ --sensor super35
-# python -m lensu export --profile my_lens.json --format ue --output ./export/
-# python -m lensu board --type charuco --size A3 --output board.pdf
-# python -m lensu library --list
-# python -m lensu library --search "Cooke"
+anamorphic: Optional[AnamorphicInfo] = None
 ```
 
-Use `argparse` (stdlib, no dependencies). Subcommands:
+In Streamlit, add anamorphic toggle in sidebar:
+- Squeeze ratio selector (2x, 1.5x, 1.33x, custom)
+- "Images are desqueezed" checkbox
+- Show both squeezed and desqueezed distortion values
 
-- `calibrate` — Single focal length calibration from images
-  - `--images DIR` — Directory of calibration images
-  - `--focal-length MM` — Focal length in mm
-  - `--pattern SIZE` — Pattern size (default: 9x6)
-  - `--square-size MM` — Square size (default: 25)
-  - `--mode checkerboard|charuco` — Detection mode
-  - `--sensor PRESET|WxH` — Sensor (full-frame, apsc-canon, apsc-sony, m43, super35, or WxHmm)
-  - `--output FILE` — Output profile JSON path
-  - `--save-library` — Also save to local library
+Update UE export to include anamorphic metadata in user_metadata.
 
-- `batch` — Multi-focal-length batch calibration
-  - `--dir DIR` — Base directory with focal length subfolders
-  - `--sensor PRESET|WxH`
-  - `--output FILE`
-  - `--save-library`
+### 2. Professional Comparison Report (NEW: src/report.py)
 
-- `export` — Export a profile to UE format
-  - `--profile FILE` — Input profile JSON
-  - `--format ue` — Export format (only UE for now)
-  - `--output DIR` — Output directory
-  - `--include-stmaps` — Include STMap files
+Generate a professional PDF calibration report:
 
-- `board` — Generate printable calibration board
-  - `--type checkerboard|charuco`
-  - `--size A4|A3|A2|A1`
-  - `--pattern SIZE` — Pattern size
-  - `--square-size MM`
-  - `--output FILE`
-
-- `library` — Manage lens library
-  - `--list` — List all profiles
-  - `--search QUERY` — Search by name
-  - `--delete FILENAME` — Delete a profile
-  - `--export FILENAME` — Export from library
-
-Also create `src/__main__.py` so `python -m lensu` works:
 ```python
-from src.cli import main
-if __name__ == "__main__":
-    main()
+def generate_calibration_report(
+    profile: LensProfile,
+    output_path: Path,
+    include_charts: bool = True,
+) -> Path:
+    """Generate a comprehensive PDF calibration report.
+    
+    Contents:
+    - Title page: lens name, date, calibrated by
+    - Lens info: sensor, focal lengths, anamorphic info
+    - Per focal length page:
+      - Distortion coefficients table
+      - Distortion grid visualization (matplotlib plot saved as image)
+      - RMS error and accuracy grade
+      - Coverage map
+      - Image center offset
+    - Zoom lens summary (if multiple focal lengths):
+      - Distortion curve across zoom range (k1 vs focal length chart)
+      - Focal length consistency
+    - Breathing data (if available):
+      - Breathing curve chart
+      - Breathing percentage
+    - Nodal offset data (if available)
+    - UE import instructions
+    - Footer: "Generated by LensU v1.3"
+    """
 ```
 
-### 4. Progress and Logging
+Use `reportlab` for PDF + `matplotlib` for charts (pip install matplotlib).
 
-Add proper progress reporting for CLI mode:
-- Use `print()` with clear status messages
-- Show per-image detection results
-- Show calibration progress percentage
-- Final summary with all metrics
-- ASCII only (no unicode — Windows cp1252 compatibility!)
+Save chart images as temporary PNGs, embed in PDF.
+
+Add "Generate Report" button in Export tab.
+
+### 3. Lens Profile Diff Tool (report.py)
+
+For comparing two calibrations of the same lens (QC/drift detection):
+
+```python
+def generate_comparison_report(
+    profile_a: LensProfile,
+    profile_b: LensProfile,
+    output_path: Path,
+) -> Path:
+    """Compare two profiles and generate a diff report.
+    
+    Shows:
+    - Side-by-side distortion coefficients
+    - Delta values with color coding (green=stable, yellow=drift, red=significant change)
+    - Overlay distortion grids
+    - RMS error comparison
+    - Recommendation: "Lens is stable" / "Recalibration recommended"
+    
+    Thresholds:
+    - k1 drift > 0.005 = yellow, > 0.02 = red
+    - Image center drift > 0.005 = yellow, > 0.02 = red
+    - Nodal offset drift > 2mm = yellow, > 5mm = red
+    """
+```
+
+### 4. README.md
+
+Write a professional README for the project:
+
+- **Header**: LensU name + tagline "Free cinema lens calibration for Unreal Engine"
+- **What it does**: 3 bullet points (calibrate, export, integrate)
+- **Quick Start**: 
+  ```
+  pip install -r requirements.txt
+  streamlit run src/app.py
+  ```
+- **CLI Usage**: Show key commands
+- **Features list**: All features with checkmarks
+- **Supported Lens Types**: Spherical primes, spherical zooms, anamorphic
+- **UE Compatibility**: 5.4, 5.5, 5.6, 5.7+
+- **Comparison with Kalibrate**: Feature table
+- **Screenshots**: Placeholder section
+- **Requirements**: Python 3.10+, OpenCV, Streamlit
+- **License**: MIT
+
+Also create `requirements.txt`:
+```
+opencv-python-headless>=4.8
+streamlit>=1.20
+numpy>=1.24
+reportlab>=4.0
+matplotlib>=3.7
+```
+
+## Dependencies
+- `pip install matplotlib` (for charts in reports)
+- reportlab already installed
 
 ## Quality Requirements
-- CLI must work standalone without Streamlit
-- Batch calibration must handle 100+ images without memory issues
-- Library must handle 100+ saved profiles
-- All error messages must be clear and actionable
-- No new pip dependencies
+- Anamorphic calibration must produce correct results for 2x squeeze
+- PDF reports must be professional quality (clean layout, readable charts)
+- README must be under 200 lines
+- All existing features must still work
+- ASCII only in CLI output (Windows cp1252!)
 
 ## Test Plan
-1. `python -c "from src.lens_library import *; from src.batch import *; from src.cli import *; print('OK')"` — imports
-2. `python -m src.cli board --type checkerboard --size A3 --output test_board.pdf` — generates PDF
-3. `python -m src.cli library --list` — lists (empty) library
-4. `streamlit run src/app.py` — app still works with new tabs
-5. Clean up test outputs
+1. All imports succeed
+2. `python -m src.cli calibrate --help` still works
+3. `streamlit run src/app.py` launches with anamorphic options visible
+4. Report generation runs without error (even with empty/dummy data)
+5. README renders correctly as markdown
 
 When completely finished, run:
-openclaw system event --text "Done: LensU Sprint 4 -- Batch processing, lens library, CLI" --mode now
+openclaw system event --text "Done: LensU Sprint 5 -- Anamorphic, reports, README" --mode now
