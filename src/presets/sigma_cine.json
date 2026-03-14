@@ -1,0 +1,16 @@
+{
+  "lens_name": "Sigma Cine FF Approximate Prime Set",
+  "lens_family": "Sigma Cine FF High Speed",
+  "type": "prime",
+  "notes": "Approximate preset values. Always calibrate your specific lens copy for virtual production work.",
+  "source": "LensU research database",
+  "calibration_points": [
+    { "focal_length_mm": 20, "k1": -0.072, "k2": 0.013, "p1": 0.0, "p2": 0.0, "k3": 0.0, "cx": 0.5, "cy": 0.5, "fx": 0.0, "fy": 0.0, "rms_error": 0.0, "num_images": 0 },
+    { "focal_length_mm": 24, "k1": -0.058, "k2": 0.01, "p1": 0.0, "p2": 0.0, "k3": 0.0, "cx": 0.5, "cy": 0.5, "fx": 0.0, "fy": 0.0, "rms_error": 0.0, "num_images": 0 },
+    { "focal_length_mm": 35, "k1": -0.031, "k2": 0.005, "p1": 0.0, "p2": 0.0, "k3": 0.0, "cx": 0.5, "cy": 0.5, "fx": 0.0, "fy": 0.0, "rms_error": 0.0, "num_images": 0 },
+    { "focal_length_mm": 50, "k1": -0.015, "k2": 0.002, "p1": 0.0, "p2": 0.0, "k3": 0.0, "cx": 0.5, "cy": 0.5, "fx": 0.0, "fy": 0.0, "rms_error": 0.0, "num_images": 0 },
+    { "focal_length_mm": 85, "k1": 0.003, "k2": 0.001, "p1": 0.0, "p2": 0.0, "k3": 0.0, "cx": 0.5, "cy": 0.5, "fx": 0.0, "fy": 0.0, "rms_error": 0.0, "num_images": 0 },
+    { "focal_length_mm": 135, "k1": 0.012, "k2": 0.001, "p1": 0.0, "p2": 0.0, "k3": 0.0, "cx": 0.5, "cy": 0.5, "fx": 0.0, "fy": 0.0, "rms_error": 0.0, "num_images": 0 }
+  ]
+}
+

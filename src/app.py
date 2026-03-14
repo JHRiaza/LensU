@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import io
 import json
+import queue
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -46,6 +48,9 @@ from lens_library import (
     search_library,
 )
 from live_calibration import live_calibration_ui
+from presets import list_presets, load_preset
+from protocols.freed import FreeDPacket, freed_to_fiz, start_freed_listener
+from protocols.opentrackio import OpenTrackIOSample, start_opentrackio_listener
 from report import generate_calibration_report, generate_comparison_report
 from ue_export import export_ue_json, export_ue_python_script
 from video_extractor import extract_frames_from_video, extract_frames_with_checkerboard
@@ -98,6 +103,145 @@ if "report_download" not in st.session_state:
     st.session_state.report_download = None
 if "comparison_report_download" not in st.session_state:
     st.session_state.comparison_report_download = None
+if "tracking_state" not in st.session_state:
+    st.session_state.tracking_state = {
+        "protocol": "FreeD",
+        "address": "239.1.1.1",
+        "port": 6000,
+        "socket": None,
+        "queue": queue.Queue(),
+        "latest": None,
+        "rows": [],
+        "recording": False,
+        "error": "",
+    }
+
+
+def _tracking_state() -> dict[str, Any]:
+    return st.session_state.tracking_state
+
+
+def _stop_tracking_listener() -> None:
+    state = _tracking_state()
+    sock = state.get("socket")
+    if sock is not None:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    state["socket"] = None
+
+
+def _start_tracking_listener(protocol: str, address: str, port: int) -> None:
+    state = _tracking_state()
+    _stop_tracking_listener()
+    callback_queue: queue.Queue[Any] = queue.Queue()
+
+    def _callback(sample: Any) -> None:
+        try:
+            callback_queue.put_nowait(sample)
+        except queue.Full:
+            return
+
+    if protocol == "FreeD":
+        sock = start_freed_listener(port=port, callback=_callback)
+    else:
+        sock = start_opentrackio_listener(address=address, port=port, callback=_callback)
+
+    state["protocol"] = protocol
+    state["address"] = address
+    state["port"] = port
+    state["queue"] = callback_queue
+    state["socket"] = sock
+    state["latest"] = None
+    state["error"] = ""
+
+
+def _tracking_row_from_freed(packet: FreeDPacket, profile: LensProfile) -> dict[str, Any]:
+    fiz = freed_to_fiz(packet, profile)
+    return {
+        "timestamp": time.time(),
+        "protocol": "FreeD",
+        "camera_id": packet.camera_id,
+        "pan_deg": round(packet.pan, 4),
+        "tilt_deg": round(packet.tilt, 4),
+        "roll_deg": round(packet.roll, 4),
+        "pos_x_mm": round(packet.pos_x, 3),
+        "pos_y_mm": round(packet.pos_y, 3),
+        "pos_z_mm": round(packet.pos_z, 3),
+        "zoom_raw": packet.zoom,
+        "focus_raw": packet.focus,
+        "zoom_mm": round(float(fiz["zoom_mm"]), 4),
+        "focus_m": round(float(fiz["focus_m"]), 4),
+        "iris": round(float(fiz["iris"]), 4),
+    }
+
+
+def _tracking_row_from_opentrackio(sample: OpenTrackIOSample) -> dict[str, Any]:
+    return {
+        "timestamp": sample.timestamp,
+        "protocol": "OpenTrackIO",
+        "camera_id": "",
+        "pan_deg": round(float(sample.rotation[0]), 4),
+        "tilt_deg": round(float(sample.rotation[1]), 4),
+        "roll_deg": round(float(sample.rotation[2]), 4),
+        "pos_x_mm": round(float(sample.translation[0]) * 1000.0, 3),
+        "pos_y_mm": round(float(sample.translation[1]) * 1000.0, 3),
+        "pos_z_mm": round(float(sample.translation[2]) * 1000.0, 3),
+        "zoom_raw": "",
+        "focus_raw": "",
+        "zoom_mm": round(float(sample.focal_length_mm), 4),
+        "focus_m": round(float(sample.focus_distance_m), 4),
+        "iris": round(float(sample.iris_fstop), 4),
+    }
+
+
+def _drain_tracking_queue(profile: LensProfile) -> None:
+    state = _tracking_state()
+    callback_queue: queue.Queue[Any] = state["queue"]
+    while True:
+        try:
+            sample = callback_queue.get_nowait()
+        except queue.Empty:
+            break
+
+        if isinstance(sample, FreeDPacket):
+            row = _tracking_row_from_freed(sample, profile)
+        elif isinstance(sample, OpenTrackIOSample):
+            row = _tracking_row_from_opentrackio(sample)
+        else:
+            continue
+
+        state["latest"] = row
+        if state.get("recording"):
+            state["rows"].append(row)
+            state["rows"] = state["rows"][-5000:]
+
+
+def _tracking_csv_bytes(rows: list[dict[str, Any]]) -> bytes:
+    if not rows:
+        return b""
+    fieldnames = [
+        "timestamp",
+        "protocol",
+        "camera_id",
+        "pan_deg",
+        "tilt_deg",
+        "roll_deg",
+        "pos_x_mm",
+        "pos_y_mm",
+        "pos_z_mm",
+        "zoom_raw",
+        "focus_raw",
+        "zoom_mm",
+        "focus_m",
+        "iris",
+    ]
+    output = io.StringIO()
+    output.write(",".join(fieldnames) + "\n")
+    for row in rows:
+        output.write(",".join(str(row.get(field, "")) for field in fieldnames) + "\n")
+    return output.getvalue().encode("utf-8")
 
 
 def _run_key(focal_length_mm: float) -> str:
@@ -816,6 +960,99 @@ def _library_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _render_live_tracking_tab(profile: LensProfile) -> None:
+    state = _tracking_state()
+    _drain_tracking_queue(profile)
+
+    st.header("Live Tracking")
+    st.info(
+        "Listen for FreeD or OpenTrackIO packets, inspect incoming FIZ values, and optionally record the stream to CSV."
+    )
+
+    protocol = st.selectbox(
+        "Protocol",
+        ["FreeD", "OpenTrackIO"],
+        index=0 if state.get("protocol") == "FreeD" else 1,
+        key="tracking_protocol",
+    )
+    default_port = int(state.get("port") or (6000 if protocol == "FreeD" else 5555))
+    port = st.number_input("Port", min_value=1, max_value=65535, value=default_port, step=1, key="tracking_port")
+    address = st.text_input(
+        "Multicast Address",
+        value=state.get("address", "239.1.1.1"),
+        disabled=protocol != "OpenTrackIO",
+        help="Only used for OpenTrackIO multicast.",
+        key="tracking_address",
+    )
+
+    action_cols = st.columns(4)
+    with action_cols[0]:
+        if st.button("Start Listener", type="primary", use_container_width=True):
+            try:
+                _start_tracking_listener(protocol, address, int(port))
+                st.rerun()
+            except OSError as exc:
+                state["error"] = str(exc)
+    with action_cols[1]:
+        if st.button("Stop Listener", use_container_width=True):
+            _stop_tracking_listener()
+            st.rerun()
+    with action_cols[2]:
+        label = "Stop Recording" if state.get("recording") else "Start Recording"
+        if st.button(label, use_container_width=True):
+            state["recording"] = not state.get("recording", False)
+            st.rerun()
+    with action_cols[3]:
+        if st.button("Clear Capture", use_container_width=True):
+            state["rows"] = []
+            state["latest"] = None
+            st.rerun()
+
+    active = state.get("socket") is not None
+    st.caption(
+        f"Listener status: {'running' if active else 'stopped'} | "
+        f"recording: {'on' if state.get('recording') else 'off'}"
+    )
+    if state.get("error"):
+        st.error(state["error"])
+
+    latest = state.get("latest")
+    if latest is None:
+        st.caption("No tracking samples received yet.")
+    else:
+        metric_cols = st.columns(6)
+        metric_cols[0].metric("Zoom", f"{latest['zoom_mm']:.2f} mm")
+        metric_cols[1].metric("Focus", f"{latest['focus_m']:.2f} m")
+        metric_cols[2].metric("Iris", f"{latest['iris']:.2f}")
+        metric_cols[3].metric("Pan", f"{latest['pan_deg']:.2f} deg")
+        metric_cols[4].metric("Tilt", f"{latest['tilt_deg']:.2f} deg")
+        metric_cols[5].metric("Roll", f"{latest['roll_deg']:.2f} deg")
+        st.dataframe([latest], use_container_width=True)
+
+    if profile.calibration_points:
+        st.caption(
+            "FreeD zoom mapping uses the current profile calibration range when no explicit encoder map is present."
+        )
+    else:
+        st.caption("Current profile has no calibration points. FreeD zoom values fall back to normalized raw encoder data.")
+
+    rows = state.get("rows", [])
+    if rows:
+        st.subheader("Recorded Samples")
+        st.dataframe(list(reversed(rows[-50:])), use_container_width=True)
+        st.download_button(
+            "Download Tracking CSV",
+            data=_tracking_csv_bytes(rows),
+            file_name=f"lensu_tracking_{protocol.lower()}_{int(time.time())}.csv",
+            mime="text/csv",
+        )
+
+    auto_refresh = st.checkbox("Auto-refresh while listener is running", value=active, key="tracking_autorefresh")
+    if active and auto_refresh:
+        time.sleep(1.0)
+        st.rerun()
+
+
 def main() -> None:
     profile: LensProfile = st.session_state.profile
     _render_header()
@@ -827,6 +1064,19 @@ def main() -> None:
             value=profile.lens_name,
             help="Profile name used in JSON and Unreal export file names.",
         )
+        preset_rows = list_presets()
+        preset_labels = ["None"] + [item["name"] for item in preset_rows]
+        selected_preset = st.selectbox(
+            "Load Preset",
+            preset_labels,
+            help="Load an approximate starter profile for a common cinema lens family.",
+        )
+        st.warning("Preset values are approximate. Always calibrate your specific lens for VP work.")
+        if selected_preset != "None" and st.button("Load Selected Preset", use_container_width=True):
+            st.session_state.profile = load_preset(selected_preset)
+            _save_profile(st.session_state.profile)
+            st.success(f"Loaded preset: {st.session_state.profile.lens_name}")
+            st.rerun()
 
         st.subheader("Sensor")
         col1, col2 = st.columns(2)
@@ -990,10 +1240,22 @@ def main() -> None:
         "anamorphic_desqueezed": bool(anamorphic_desqueezed),
     }
 
-    tab_calibrate, tab_live, tab_video, tab_batch, tab_breathing, tab_nodal, tab_profile, tab_library, tab_export = st.tabs(
+    (
+        tab_calibrate,
+        tab_live,
+        tab_tracking,
+        tab_video,
+        tab_batch,
+        tab_breathing,
+        tab_nodal,
+        tab_profile,
+        tab_library,
+        tab_export,
+    ) = st.tabs(
         [
             "Distortion Calibration",
             "Live Calibration",
+            "Live Tracking",
             "Video Calibration",
             "Batch Calibration",
             "Lens Breathing",
@@ -1093,6 +1355,9 @@ def main() -> None:
             _store_run(float(live_focal_length), detection_mode, point, diagnostics, files, settings)
             _save_profile(profile)
             st.success(f"Live calibration complete. RMS: {point.rms_error:.4f}px.")
+
+    with tab_tracking:
+        _render_live_tracking_tab(profile)
 
     with tab_video:
         st.header("Video Calibration")

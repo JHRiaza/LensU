@@ -88,6 +88,8 @@ class LensProfile:
     """Complete lens calibration profile."""
 
     lens_name: str = "Unknown Lens"
+    lens_family: str = ""
+    lens_type: str = "prime"
     sensor_width_mm: float = 36.0
     sensor_height_mm: float = 24.0
     image_width: int = 1920
@@ -96,6 +98,9 @@ class LensProfile:
     nodal_offsets: list[NodalOffset] = field(default_factory=list)
     breathing_profiles: list[BreathingProfile] = field(default_factory=list)
     anamorphic: Optional[AnamorphicInfo] = None
+    notes: str = ""
+    source: str = ""
+    encoder_mappings: dict[str, list[dict[str, float]]] = field(default_factory=dict)
 
     def add_calibration(self, point: CalibrationPoint) -> None:
         self.calibration_points = [
@@ -181,10 +186,15 @@ class CalibrationDiagnostics:
 def lens_profile_from_dict(data: dict) -> LensProfile:
     profile = LensProfile(
         lens_name=data.get("lens_name", "Unknown"),
+        lens_family=data.get("lens_family", ""),
+        lens_type=data.get("lens_type", data.get("type", "prime")),
         sensor_width_mm=data.get("sensor_width_mm", 36.0),
         sensor_height_mm=data.get("sensor_height_mm", 24.0),
         image_width=data.get("image_width", 1920),
         image_height=data.get("image_height", 1080),
+        notes=data.get("notes", ""),
+        source=data.get("source", ""),
+        encoder_mappings=data.get("encoder_mappings", {}) or {},
     )
     for point in data.get("calibration_points", []):
         profile.calibration_points.append(CalibrationPoint(**point))

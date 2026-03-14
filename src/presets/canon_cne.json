@@ -1,0 +1,15 @@
+{
+  "lens_name": "Canon CN-E Approximate Prime Set",
+  "lens_family": "Canon CN-E",
+  "type": "prime",
+  "notes": "Approximate preset values. Always calibrate your specific lens copy for virtual production work.",
+  "source": "LensU research database",
+  "calibration_points": [
+    { "focal_length_mm": 20, "k1": -0.086, "k2": 0.015, "p1": 0.0, "p2": 0.0, "k3": 0.0, "cx": 0.5, "cy": 0.5, "fx": 0.0, "fy": 0.0, "rms_error": 0.0, "num_images": 0 },
+    { "focal_length_mm": 24, "k1": -0.069, "k2": 0.012, "p1": 0.0, "p2": 0.0, "k3": 0.0, "cx": 0.5, "cy": 0.5, "fx": 0.0, "fy": 0.0, "rms_error": 0.0, "num_images": 0 },
+    { "focal_length_mm": 35, "k1": -0.034, "k2": 0.006, "p1": 0.0, "p2": 0.0, "k3": 0.0, "cx": 0.5, "cy": 0.5, "fx": 0.0, "fy": 0.0, "rms_error": 0.0, "num_images": 0 },
+    { "focal_length_mm": 50, "k1": -0.017, "k2": 0.003, "p1": 0.0, "p2": 0.0, "k3": 0.0, "cx": 0.5, "cy": 0.5, "fx": 0.0, "fy": 0.0, "rms_error": 0.0, "num_images": 0 },
+    { "focal_length_mm": 85, "k1": 0.005, "k2": 0.001, "p1": 0.0, "p2": 0.0, "k3": 0.0, "cx": 0.5, "cy": 0.5, "fx": 0.0, "fy": 0.0, "rms_error": 0.0, "num_images": 0 },
+    { "focal_length_mm": 135, "k1": 0.015, "k2": 0.001, "p1": 0.0, "p2": 0.0, "k3": 0.0, "cx": 0.5, "cy": 0.5, "fx": 0.0, "fy": 0.0, "rms_error": 0.0, "num_images": 0 }
+  ]
+}
