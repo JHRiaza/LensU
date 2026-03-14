@@ -1,149 +1,182 @@
-# AGENTS.md — LensU Sprint 3: Live Camera Feed + Lens Breathing + Auto Nodal
+# AGENTS.md — LensU Sprint 4: Batch Processing + Lens Library + CLI
 
 ## Goal
-Add real-time calibration from live camera feed and advanced calibration features that no competitor offers.
+Make LensU production-ready for VP stages: batch calibration, reusable lens library, and a CLI for automated pipelines.
 
 ## Tasks
 
-### 1. Live Camera Feed Calibration (NEW: src/live_calibration.py)
+### 1. Lens Library (NEW: src/lens_library.py)
 
-Real-time calibration using webcam or capture card:
+A local database of calibrated lens profiles that users can save, browse, and reuse:
 
 ```python
-import cv2
-import streamlit as st
+from pathlib import Path
+import json
 
-def live_calibration_ui():
-    """Streamlit component for live camera calibration.
+LIBRARY_DIR = Path.home() / ".lensu" / "library"
+
+def save_to_library(profile: LensProfile) -> Path:
+    """Save a calibrated lens profile to the local library.
+    Creates: ~/.lensu/library/{lens_name}_{date}.json
+    """
+
+def list_library() -> list[dict]:
+    """List all saved profiles with summary info.
+    Returns: [{name, date, focal_lengths, sensor, rms_avg}, ...]
+    """
+
+def load_from_library(filename: str) -> LensProfile:
+    """Load a profile from the library."""
+
+def delete_from_library(filename: str) -> bool:
+    """Delete a profile from the library."""
+
+def search_library(lens_name: str = "", sensor_type: str = "") -> list[dict]:
+    """Search library by lens name or sensor type."""
+```
+
+Add a "Lens Library" tab in Streamlit:
+- Browse saved profiles with search/filter
+- Load a profile into the current session
+- Delete old profiles
+- Export any library profile as UE package
+- Show statistics: total profiles, lens families, date range
+
+### 2. Batch Calibration (NEW: src/batch.py)
+
+For calibrating multiple focal lengths in one go from organized folders:
+
+```python
+def batch_calibrate(
+    base_dir: Path,
+    pattern_size: tuple[int, int] = (9, 6),
+    square_size_mm: float = 25.0,
+    detection_mode: str = "checkerboard",  # or "charuco"
+    sensor_width_mm: float = 36.0,
+    sensor_height_mm: float = 24.0,
+) -> LensProfile:
+    """Batch calibrate from a folder structure:
     
-    Workflow:
-    1. Select camera device (index or name)
-    2. Show live feed with checkerboard/ChArUco overlay
-    3. Auto-detect board in each frame
-    4. When board detected, show green overlay + "Press CAPTURE" button
-    5. Capture frames with good coverage diversity (track which quadrants are covered)
-    6. Show coverage heatmap updating in real-time
-    7. When enough frames captured (15+), enable "CALIBRATE" button
-    8. Run calibration on captured frames
+    base_dir/
+      24mm/
+        img001.jpg
+        img002.jpg
+        ...
+      35mm/
+        img001.jpg
+        ...
+      50mm/
+        ...
+    
+    Each subfolder name must contain the focal length in mm (e.g., "24mm", "24", "FL24").
+    Extracts the number, calibrates each folder, builds a complete LensProfile.
+    
+    Returns a LensProfile with all focal lengths calibrated.
+    """
+
+def batch_calibrate_from_videos(
+    base_dir: Path,
+    pattern_size: tuple[int, int] = (9, 6),
+    square_size_mm: float = 25.0,
+    max_frames_per_video: int = 30,
+    **kwargs,
+) -> LensProfile:
+    """Same as batch_calibrate but each subfolder contains a video file
+    instead of images. Extracts frames automatically.
+    
+    base_dir/
+      24mm/
+        calibration.mp4
+      50mm/
+        calibration.mov
     """
 ```
 
-Use `st.camera_input()` for Streamlit's native camera access. If that's not available or doesn't support continuous capture, use OpenCV's `cv2.VideoCapture(0)` with `st.image()` for display + a capture button.
+Add batch calibration to Streamlit:
+- Folder path input (or drag-drop folder structure description)
+- Progress bar showing calibration progress per focal length
+- Summary table with all results at the end
 
-Key features:
-- Camera device selector (list available cameras)
-- Live checkerboard/ChArUco detection overlay
-- Coverage indicator showing which sensor regions have been captured
-- "Auto-capture" mode that captures frames automatically when a new viewing angle is detected
-- Minimum 15 frames before allowing calibration
-- Real-time RMS error display after each new frame
+### 3. CLI Interface (NEW: src/cli.py)
 
-### 2. Lens Breathing Compensation (calibration.py + app.py)
+Command-line interface for automated pipelines (no browser needed):
 
-Cinema lenses shift focal length when focus changes (breathing). This affects VP tracking.
-
-Add to calibration.py:
 ```python
-@dataclass
-class BreathingPoint:
-    """Focal length measurement at a specific focus distance."""
-    focus_distance_m: float  # focus distance in meters
-    measured_focal_length_mm: float  # actual focal length at this focus
-    nominal_focal_length_mm: float  # labeled focal length on the lens
-
-@dataclass  
-class BreathingProfile:
-    """Lens breathing curve for a specific nominal focal length."""
-    nominal_focal_length_mm: float
-    points: list[BreathingPoint]
-    
-    def breathing_ratio(self) -> float:
-        """Max breathing as a percentage of nominal focal length."""
-        if not self.points:
-            return 0.0
-        fls = [p.measured_focal_length_mm for p in self.points]
-        return (max(fls) - min(fls)) / self.nominal_focal_length_mm * 100
+# Usage:
+# python -m lensu calibrate --images ./photos/50mm/ --focal-length 50 --sensor full-frame
+# python -m lensu batch --dir ./calibration_shots/ --sensor super35
+# python -m lensu export --profile my_lens.json --format ue --output ./export/
+# python -m lensu board --type charuco --size A3 --output board.pdf
+# python -m lensu library --list
+# python -m lensu library --search "Cooke"
 ```
 
-Add to LensProfile:
+Use `argparse` (stdlib, no dependencies). Subcommands:
+
+- `calibrate` — Single focal length calibration from images
+  - `--images DIR` — Directory of calibration images
+  - `--focal-length MM` — Focal length in mm
+  - `--pattern SIZE` — Pattern size (default: 9x6)
+  - `--square-size MM` — Square size (default: 25)
+  - `--mode checkerboard|charuco` — Detection mode
+  - `--sensor PRESET|WxH` — Sensor (full-frame, apsc-canon, apsc-sony, m43, super35, or WxHmm)
+  - `--output FILE` — Output profile JSON path
+  - `--save-library` — Also save to local library
+
+- `batch` — Multi-focal-length batch calibration
+  - `--dir DIR` — Base directory with focal length subfolders
+  - `--sensor PRESET|WxH`
+  - `--output FILE`
+  - `--save-library`
+
+- `export` — Export a profile to UE format
+  - `--profile FILE` — Input profile JSON
+  - `--format ue` — Export format (only UE for now)
+  - `--output DIR` — Output directory
+  - `--include-stmaps` — Include STMap files
+
+- `board` — Generate printable calibration board
+  - `--type checkerboard|charuco`
+  - `--size A4|A3|A2|A1`
+  - `--pattern SIZE` — Pattern size
+  - `--square-size MM`
+  - `--output FILE`
+
+- `library` — Manage lens library
+  - `--list` — List all profiles
+  - `--search QUERY` — Search by name
+  - `--delete FILENAME` — Delete a profile
+  - `--export FILENAME` — Export from library
+
+Also create `src/__main__.py` so `python -m lensu` works:
 ```python
-breathing_profiles: list[BreathingProfile] = field(default_factory=list)
+from src.cli import main
+if __name__ == "__main__":
+    main()
 ```
 
-In the Streamlit UI, add a "Lens Breathing" tab:
-- User calibrates at several focus distances (infinity, 3m, 1.5m, 1m, 0.5m)
-- At each focus distance, system measures effective focal length from calibration
-- Shows breathing curve graph (focus distance vs measured focal length)
-- Reports breathing percentage
-- Exports breathing data in the UE JSON (mapped to Focus axis in FIZ table)
+### 4. Progress and Logging
 
-### 3. Guided Nodal Offset Estimation (calibration.py + app.py)
-
-Instead of manual entry, guide the user through measuring nodal offset:
-
-Add to app.py Nodal Offset tab:
-```
-Guided Nodal Offset Test:
-
-1. Mount camera on a calibrated tripod head (with distance markings)
-2. Place two vertical objects at different distances (near: 1m, far: 3m)
-3. Rotate camera left/right while looking at the parallax between objects
-4. Take a photo at each rotation angle (-10°, -5°, 0°, +5°, +10°)
-5. Upload the 5 photos
-6. LensU analyzes the parallax shift to estimate the entrance pupil position
-```
-
-Add to calibration.py:
-```python
-def estimate_nodal_from_parallax(
-    images: list[np.ndarray],
-    rotation_angles_deg: list[float],
-    near_object_distance_m: float = 1.0,
-    far_object_distance_m: float = 3.0,
-) -> NodalOffset:
-    """Estimate entrance pupil position from parallax test images.
-    
-    Uses feature matching between images to measure parallax shift
-    at known rotation angles. The nodal point is where the parallax
-    is zero (entrance pupil).
-    
-    Simplified approach:
-    1. Detect features in all images (ORB or SIFT)
-    2. Match features between consecutive rotation pairs
-    3. Measure horizontal shift of matched features
-    4. Fit a linear model: shift = k * (distance_from_nodal * sin(angle))
-    5. Solve for distance_from_nodal
-    """
-```
-
-This doesn't need to be perfect — even a rough estimate is better than no nodal data. Show confidence level.
-
-### 4. Update UE Export for New Data
-
-Add to ue_export.py:
-- Export breathing data as additional FocalLength points indexed by Focus value
-- Include breathing_ratio in user_metadata
-- STMaps generated per focal length included in ZIP
-
-Update the UE Python import script to handle breathing data (map to focus-indexed focal length points).
-
-## Dependencies
-- No new pip installs needed
-- OpenCV handles camera capture, feature matching
+Add proper progress reporting for CLI mode:
+- Use `print()` with clear status messages
+- Show per-image detection results
+- Show calibration progress percentage
+- Final summary with all metrics
+- ASCII only (no unicode — Windows cp1252 compatibility!)
 
 ## Quality Requirements
-- Live camera must work with standard USB webcams
-- Breathing measurement should be accurate to ±0.5mm focal length
-- Nodal estimation should be accurate to ±5mm (rough but useful)
-- All existing features must still work
-- App must not crash if camera is not available
+- CLI must work standalone without Streamlit
+- Batch calibration must handle 100+ images without memory issues
+- Library must handle 100+ saved profiles
+- All error messages must be clear and actionable
+- No new pip dependencies
 
 ## Test Plan
-1. All imports succeed
-2. Streamlit app launches without errors
-3. Camera feed works (if webcam available) or shows graceful error
-4. Breathing tab renders correctly with placeholder data
-5. Nodal estimation works with test images (or shows clear instructions)
+1. `python -c "from src.lens_library import *; from src.batch import *; from src.cli import *; print('OK')"` — imports
+2. `python -m src.cli board --type checkerboard --size A3 --output test_board.pdf` — generates PDF
+3. `python -m src.cli library --list` — lists (empty) library
+4. `streamlit run src/app.py` — app still works with new tabs
+5. Clean up test outputs
 
 When completely finished, run:
-openclaw system event --text "Done: LensU Sprint 3 -- Live camera, breathing, auto nodal" --mode now
+openclaw system event --text "Done: LensU Sprint 4 -- Batch processing, lens library, CLI" --mode now
