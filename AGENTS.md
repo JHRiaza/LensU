@@ -1,170 +1,150 @@
-# AGENTS.md — LensU Sprint 7: Fisheye Support + Encoder Mapping + pyproject.toml
+# AGENTS.md — LensU Sprint 8: REST API + Multi-Camera + Nuke Export
 
 ## Goal
-Add fisheye/ultra-wide lens calibration, FIZ encoder mapping tables, and package the project for pip install.
+Add a REST API for external tool integration, multi-camera calibration support, and Nuke-compatible export.
 
 ## Tasks
 
-### 1. Fisheye Calibration (calibration.py)
+### 1. REST API Server (NEW: src/api.py)
 
-Cinema productions increasingly use ultra-wide and fisheye lenses. OpenCV has a dedicated fisheye module:
+A lightweight FastAPI/Flask server so external tools can trigger calibration programmatically:
+
+Since we want NO new dependencies, use Python's built-in `http.server` with a simple JSON API:
 
 ```python
-def calibrate_fisheye(
-    image_paths: list[Path],
-    pattern_size: tuple[int, int] = (9, 6),
-    square_size_mm: float = 25.0,
-    focal_length_mm: float = 14.0,
-) -> tuple[Optional[CalibrationPoint], list[bool]]:
-    """Calibrate a fisheye/ultra-wide lens using cv2.fisheye.
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import json
+
+class LensUAPIHandler(BaseHTTPRequestHandler):
+    """Simple REST API for LensU.
     
-    Uses cv2.fisheye.calibrate() which uses the equidistant projection model
-    with 4 distortion coefficients (k1-k4), different from the standard model.
+    Endpoints:
     
-    Steps:
-    1. Detect checkerboard corners in images
-    2. Run cv2.fisheye.calibrate() with appropriate flags
-    3. Store results as CalibrationPoint with is_fisheye=True flag
-    4. Map fisheye k1-k4 to the standard CalibrationPoint structure
+    GET /api/status
+      Returns: {"status": "ok", "version": "1.5.0"}
+    
+    GET /api/library
+      Returns: list of saved lens profiles
+    
+    GET /api/library/{name}
+      Returns: specific profile data
+    
+    POST /api/calibrate
+      Body: {"images_dir": "path", "focal_length_mm": 50, "pattern_size": [9,6], "sensor": "full-frame"}
+      Returns: {"calibration_point": {...}, "rms_error": 0.3, "images_used": 15}
+    
+    POST /api/batch
+      Body: {"base_dir": "path", "sensor": "super35"}
+      Returns: {"profile": {...}, "focal_lengths_calibrated": [24, 35, 50]}
+    
+    POST /api/export
+      Body: {"profile_name": "my_lens", "format": "ue", "include_stmaps": true}
+      Returns: ZIP file as binary
+    
+    GET /api/presets
+      Returns: list of available preset profiles
+    
+    GET /api/presets/{name}
+      Returns: preset profile data
     """
+
+def start_api_server(host: str = "0.0.0.0", port: int = 8600):
+    """Start the LensU API server."""
 ```
 
-Add `is_fisheye: bool = False` and `fisheye_coeffs: list[float] = field(default_factory=list)` to CalibrationPoint.
+Add CLI command: `lensu serve --port 8600`
 
-Update Streamlit: add "Fisheye Mode" toggle in calibration tab. When enabled, use fisheye calibration. Show fisheye-specific info (equidistant model, FOV > 120 degrees).
+### 2. Multi-Camera Support (calibration.py + app.py)
 
-Update UE export: fisheye lenses may need STMap-based export since UE's parametric model may not support equidistant projection. Always generate STMap for fisheye.
+VP stages often have multiple cameras. Add ability to manage calibrations for multiple cameras in one session:
 
-### 2. FIZ Encoder Mapping Tables (NEW: src/encoder_mapping.py)
-
-Map raw encoder values (0-65535) from FreeD/OpenTrackIO to physical lens values:
-
+Add to calibration.py:
 ```python
 @dataclass
-class EncoderMapping:
-    """Maps raw encoder values to physical lens parameters."""
-    lens_name: str
-    # Focus mapping: [(encoder_value, focus_distance_m), ...]
-    focus_map: list[tuple[int, float]] = field(default_factory=list)
-    # Zoom mapping: [(encoder_value, focal_length_mm), ...]
-    zoom_map: list[tuple[int, float]] = field(default_factory=list)
-    # Iris mapping: [(encoder_value, t_stop), ...]
-    iris_map: list[tuple[int, float]] = field(default_factory=list)
+class CameraRig:
+    """A collection of cameras with their lens profiles."""
+    rig_name: str = "Default Rig"
+    cameras: dict[str, LensProfile] = field(default_factory=dict)
+    # Key = camera label (e.g., "Camera A", "Main", "Witness")
+    
+    def add_camera(self, label: str, profile: LensProfile):
+        self.cameras[label] = profile
+    
+    def to_dict(self) -> dict:
+        return {
+            "rig_name": self.rig_name,
+            "cameras": {k: v.to_dict() for k, v in self.cameras.items()}
+        }
+    
+    def save_json(self, path: Path):
+        path.write_text(json.dumps(self.to_dict(), indent=2))
+```
 
-    def encoder_to_focus(self, raw: int) -> float:
-        """Interpolate raw encoder value to focus distance in meters."""
-        
-    def encoder_to_zoom(self, raw: int) -> float:
-        """Interpolate raw encoder value to focal length in mm."""
+In Streamlit sidebar, add camera selector:
+- "Add Camera" button
+- Camera label input
+- Switch between cameras
+- Each camera has its own LensProfile
+- Export all cameras as a multi-camera UE package
 
-    def encoder_to_iris(self, raw: int) -> float:
-        """Interpolate raw encoder value to T-stop."""
+### 3. Nuke Export (NEW: src/nuke_export.py)
 
-def create_mapping_from_samples(
-    samples: list[tuple[int, float]],
-) -> list[tuple[int, float]]:
-    """Create a mapping table from measured samples.
-    User measures encoder value at known physical positions.
-    Returns sorted mapping table ready for interpolation.
+Export calibration data for The Foundry Nuke (common in VP post-production):
+
+```python
+def export_nuke_script(
+    profile: LensProfile,
+    output_path: Path,
+) -> Path:
+    """Generate a Nuke .nk script with LensDistortion node.
+    
+    Creates a Nuke script containing:
+    - LensDistortion node with calibrated k1, k2, k3, p1, p2 values
+    - Correct image format (resolution + pixel aspect)
+    - STMap generator setup for undistortion
+    - Read node placeholder for plate input
+    
+    Nuke LensDistortion node uses similar Brown-Conrady model to OpenCV.
+    """
+
+def export_nuke_gizmo(
+    profile: LensProfile,
+    output_path: Path,
+) -> Path:
+    """Generate a Nuke .gizmo for reusable lens correction.
+    
+    A gizmo is a reusable Nuke node group that:
+    - Takes input plate
+    - Applies undistortion using calibrated parameters
+    - Has knobs for adjusting parameters
+    - Includes lens info in label
     """
 ```
 
-Add "Encoder Mapping" section in the Live Tracking tab:
-- Table input: "At encoder value X, the lens is at Y mm/m/T"
-- User fills in 5-10 calibration points
-- Shows interpolation curve
-- Save/load encoder mappings per lens
-- Link to protocols: when FreeD/OpenTrackIO data arrives, auto-map using the table
+Add Nuke export option in the Export tab alongside UE export.
 
-### 3. Package as pip-installable (pyproject.toml)
+### 4. Update Tests
 
-Create proper Python packaging so users can `pip install lensu`:
-
-```toml
-[build-system]
-requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
-
-[project]
-name = "lensu"
-version = "1.5.0"
-description = "Cinema lens calibration tool for Unreal Engine virtual production"
-readme = "README.md"
-license = {text = "MIT"}
-requires-python = ">=3.10"
-authors = [{name = "Javier Herreros Riaza", email = "hello@javierherreros.xyz"}]
-keywords = ["lens", "calibration", "unreal-engine", "virtual-production", "opencv", "cinema"]
-classifiers = [
-    "Development Status :: 4 - Beta",
-    "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
-    "Topic :: Multimedia :: Video",
-    "Topic :: Scientific/Engineering :: Image Processing",
-]
-dependencies = [
-    "opencv-python-headless>=4.8",
-    "streamlit>=1.20",
-    "numpy>=1.24",
-    "reportlab>=4.0",
-    "matplotlib>=3.7",
-]
-
-[project.optional-dependencies]
-dev = ["pytest>=7.0"]
-
-[project.scripts]
-lensu = "src.cli:main"
-lensu-gui = "src.app:main"
-
-[project.urls]
-Homepage = "https://github.com/jhriaza/lensu"
-```
-
-Create `src/__init__.py` with version:
-```python
-__version__ = "1.5.0"
-```
-
-Update CLI to show version: `lensu --version`
-
-Create `.gitignore`:
-```
-__pycache__/
-*.pyc
-.pytest_cache/
-*.egg-info/
-dist/
-build/
-.tmp_test/
-*.tiff
-*.exr
-```
-
-### 4. Clean Up Root Directory
-
-The project has duplicate files in root and src/. Remove root-level duplicates:
-- Delete: calibration.py, ue_export.py, app.py, stmap.py, board_generator.py, video_extractor.py, live_calibration.py, batch.py, lens_library.py, report.py, presets.py, lensu.py (root copies)
-- Delete: protocols/ directory at root (keep src/protocols/)
-- Delete: all __pycache__/ directories at root
-- Keep only: src/, research/, README.md, requirements.txt, pyproject.toml, LICENSE, .gitignore, AGENTS.md
-
-All imports should use `src.` prefix or update to work as a package.
+Add tests for:
+- API endpoint responses (mock HTTP)
+- CameraRig serialization
+- Nuke script generation (check output contains expected node names)
+- Encoder mapping interpolation accuracy
 
 ## Quality Requirements
-- `pip install -e .` must work (editable install)
-- `lensu --version` must show 1.5.0
-- `lensu-gui` must launch Streamlit
-- All 13+ tests must still pass
-- Fisheye calibration must handle lenses with FOV > 180 degrees gracefully
-- No new external dependencies beyond what's already in requirements.txt
+- API server must be optional (not started by default)
+- No new pip dependencies (use stdlib http.server)
+- Multi-camera must not break single-camera workflow
+- Nuke export must produce valid .nk syntax
+- All existing tests must pass + new tests
 
 ## Test Plan
-1. Clean up root duplicates first
-2. `pip install -e .` — editable install works
-3. `lensu --version` — shows version
-4. `python -m pytest src/tests/ -v` — all tests pass
-5. `streamlit run src/app.py` — app works with fisheye toggle
-6. Import test: `from src.encoder_mapping import *; print('OK')`
+1. All imports succeed
+2. `python -m pytest src/tests/ -v` — all tests pass
+3. API server starts and responds to GET /api/status
+4. Multi-camera CameraRig serializes/deserializes correctly
+5. Nuke export generates parseable .nk file
+6. `streamlit run src/app.py` — app works with multi-camera selector
 
 When completely finished, run:
-openclaw system event --text "Done: LensU Sprint 7 -- Fisheye, encoder mapping, packaging" --mode now
+openclaw system event --text "Done: LensU Sprint 8 -- REST API, multi-camera, Nuke export" --mode now
