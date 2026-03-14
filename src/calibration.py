@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -34,6 +35,29 @@ class CalibrationPoint:
 
 
 @dataclass
+class BreathingPoint:
+    """Focal length measurement at a specific focus distance."""
+
+    focus_distance_m: float
+    measured_focal_length_mm: float
+    nominal_focal_length_mm: float
+
+
+@dataclass
+class BreathingProfile:
+    """Lens breathing curve for a specific nominal focal length."""
+
+    nominal_focal_length_mm: float
+    points: list[BreathingPoint] = field(default_factory=list)
+
+    def breathing_ratio(self) -> float:
+        if not self.points or not self.nominal_focal_length_mm:
+            return 0.0
+        focal_lengths = [point.measured_focal_length_mm for point in self.points]
+        return (max(focal_lengths) - min(focal_lengths)) / self.nominal_focal_length_mm * 100.0
+
+
+@dataclass
 class NodalOffset:
     """Nodal point offset at a specific focal length."""
 
@@ -44,6 +68,8 @@ class NodalOffset:
     rotation_x: float = 0.0
     rotation_y: float = 0.0
     rotation_z: float = 0.0
+    confidence: float = 0.0
+    method: str = "manual"
 
 
 @dataclass
@@ -57,6 +83,7 @@ class LensProfile:
     image_height: int = 1080
     calibration_points: list[CalibrationPoint] = field(default_factory=list)
     nodal_offsets: list[NodalOffset] = field(default_factory=list)
+    breathing_profiles: list[BreathingProfile] = field(default_factory=list)
 
     def add_calibration(self, point: CalibrationPoint) -> None:
         self.calibration_points = [
@@ -72,6 +99,25 @@ class LensProfile:
         self.nodal_offsets.append(offset)
         self.nodal_offsets.sort(key=lambda n: n.focal_length_mm)
 
+    def add_breathing_point(self, point: BreathingPoint) -> None:
+        existing = next(
+            (
+                profile
+                for profile in self.breathing_profiles
+                if abs(profile.nominal_focal_length_mm - point.nominal_focal_length_mm) <= 0.1
+            ),
+            None,
+        )
+        if existing is None:
+            existing = BreathingProfile(nominal_focal_length_mm=point.nominal_focal_length_mm)
+            self.breathing_profiles.append(existing)
+        existing.points = [
+            item for item in existing.points if abs(item.focus_distance_m - point.focus_distance_m) > 0.01
+        ]
+        existing.points.append(point)
+        existing.points.sort(key=lambda item: item.focus_distance_m)
+        self.breathing_profiles.sort(key=lambda profile: profile.nominal_focal_length_mm)
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -81,18 +127,7 @@ class LensProfile:
     @classmethod
     def load_json(cls, path: Path) -> "LensProfile":
         data = json.loads(path.read_text(encoding="utf-8"))
-        profile = cls(
-            lens_name=data.get("lens_name", "Unknown"),
-            sensor_width_mm=data.get("sensor_width_mm", 36.0),
-            sensor_height_mm=data.get("sensor_height_mm", 24.0),
-            image_width=data.get("image_width", 1920),
-            image_height=data.get("image_height", 1080),
-        )
-        for point in data.get("calibration_points", []):
-            profile.calibration_points.append(CalibrationPoint(**point))
-        for offset in data.get("nodal_offsets", []):
-            profile.nodal_offsets.append(NodalOffset(**offset))
-        return profile
+        return lens_profile_from_dict(data)
 
 
 @dataclass
@@ -129,6 +164,31 @@ class CalibrationDiagnostics:
             for item in self.image_results
             if item.reprojection_error is not None and item.reprojection_error > (2.0 * mean_error)
         ]
+
+
+def lens_profile_from_dict(data: dict) -> LensProfile:
+    profile = LensProfile(
+        lens_name=data.get("lens_name", "Unknown"),
+        sensor_width_mm=data.get("sensor_width_mm", 36.0),
+        sensor_height_mm=data.get("sensor_height_mm", 24.0),
+        image_width=data.get("image_width", 1920),
+        image_height=data.get("image_height", 1080),
+    )
+    for point in data.get("calibration_points", []):
+        profile.calibration_points.append(CalibrationPoint(**point))
+    for offset in data.get("nodal_offsets", []):
+        profile.nodal_offsets.append(NodalOffset(**offset))
+    for breathing in data.get("breathing_profiles", []):
+        profile.breathing_profiles.append(
+            BreathingProfile(
+                nominal_focal_length_mm=breathing.get("nominal_focal_length_mm", 0.0),
+                points=[BreathingPoint(**point) for point in breathing.get("points", [])],
+            )
+        )
+    profile.calibration_points.sort(key=lambda point: point.focal_length_mm)
+    profile.nodal_offsets.sort(key=lambda point: point.focal_length_mm)
+    profile.breathing_profiles.sort(key=lambda point: point.nominal_focal_length_mm)
+    return profile
 
 
 def aruco_available() -> bool:
@@ -284,7 +344,6 @@ def calibrate_from_images(
     obj_points: list[np.ndarray] = []
     img_points: list[np.ndarray] = []
     image_names: list[str] = []
-    image_sizes: list[tuple[int, int]] = []
     diagnostics = CalibrationDiagnostics(image_size=None)
 
     for path in image_paths:
@@ -296,7 +355,6 @@ def calibrate_from_images(
             continue
 
         current_size = (img.shape[1], img.shape[0])
-        image_sizes.append(current_size)
         diagnostics.image_size = diagnostics.image_size or current_size
 
         found, corners, _ = detect_checkerboard(img, pattern_size)
@@ -462,6 +520,27 @@ def normalized_focal_lengths(point: CalibrationPoint, image_size: tuple[int, int
     return float(point.fx / width), float(point.fy / height)
 
 
+def measured_focal_length_mm(point: CalibrationPoint, sensor_width_mm: float, image_width: int) -> float:
+    if not sensor_width_mm or not image_width:
+        return 0.0
+    return float(point.fx * sensor_width_mm / image_width)
+
+
+def coverage_fraction(
+    diagnostics: CalibrationDiagnostics,
+    bins: tuple[int, int] = (4, 4),
+) -> float:
+    if not diagnostics.image_results:
+        return 0.0
+    occupied = np.zeros((bins[1], bins[0]), dtype=bool)
+    for result in diagnostics.image_results:
+        for x_norm, y_norm in result.coverage_points:
+            x_idx = min(int(x_norm * bins[0]), bins[0] - 1)
+            y_idx = min(int(y_norm * bins[1]), bins[1] - 1)
+            occupied[y_idx, x_idx] = True
+    return float(occupied.mean())
+
+
 def undistort_image(
     image: np.ndarray,
     point: CalibrationPoint,
@@ -526,7 +605,16 @@ def generate_distortion_grid(
         warped = distort_points(line, point, image_size).astype(np.int32)
         cv2.polylines(canvas, [warped], False, distorted_color, 1, cv2.LINE_AA)
 
-    cv2.putText(canvas, "Ideal grid (gray) vs distorted grid (cyan)", (20, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (220, 220, 220), 2, cv2.LINE_AA)
+    cv2.putText(
+        canvas,
+        "Ideal grid (gray) vs distorted grid (cyan)",
+        (20, 36),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (220, 220, 220),
+        2,
+        cv2.LINE_AA,
+    )
     return canvas
 
 
@@ -603,4 +691,79 @@ def estimate_nodal_offset(
         offset_x=float(avg_t[0]),
         offset_y=float(avg_t[1]),
         offset_z=float(avg_t[2]),
+        confidence=0.25,
+        method="pose-average",
+    )
+
+
+def estimate_nodal_from_parallax(
+    images: list[np.ndarray],
+    rotation_angles_deg: list[float],
+    near_object_distance_m: float = 1.0,
+    far_object_distance_m: float = 3.0,
+) -> NodalOffset:
+    """Estimate entrance pupil position from a rough parallax test image set."""
+
+    if len(images) < 2 or len(images) != len(rotation_angles_deg):
+        raise ValueError("Provide matching image and rotation-angle lists.")
+
+    orb = cv2.ORB_create(nfeatures=1500)
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    shifts: list[float] = []
+    angle_terms: list[float] = []
+    match_counts: list[int] = []
+
+    for index in range(len(images) - 1):
+        gray_a = cv2.cvtColor(images[index], cv2.COLOR_BGR2GRAY) if images[index].ndim == 3 else images[index]
+        gray_b = (
+            cv2.cvtColor(images[index + 1], cv2.COLOR_BGR2GRAY)
+            if images[index + 1].ndim == 3
+            else images[index + 1]
+        )
+        keypoints_a, descriptors_a = orb.detectAndCompute(gray_a, None)
+        keypoints_b, descriptors_b = orb.detectAndCompute(gray_b, None)
+        if descriptors_a is None or descriptors_b is None or not keypoints_a or not keypoints_b:
+            continue
+
+        matches = matcher.match(descriptors_a, descriptors_b)
+        if len(matches) < 12:
+            continue
+        matches = sorted(matches, key=lambda match: match.distance)[:200]
+        deltas = np.array(
+            [
+                keypoints_b[match.trainIdx].pt[0] - keypoints_a[match.queryIdx].pt[0]
+                for match in matches
+            ],
+            dtype=np.float32,
+        )
+        shift_px = float(np.median(deltas))
+        angle_a = math.radians(rotation_angles_deg[index])
+        angle_b = math.radians(rotation_angles_deg[index + 1])
+        angle_term = abs(math.sin(angle_b) - math.sin(angle_a))
+        if angle_term <= 1e-6:
+            continue
+        shifts.append(shift_px)
+        angle_terms.append(angle_term)
+        match_counts.append(len(matches))
+
+    if len(shifts) < 2:
+        return NodalOffset(focal_length_mm=0.0, confidence=0.0, method="parallax-insufficient")
+
+    shifts_np = np.asarray(shifts, dtype=np.float32)
+    angle_np = np.asarray(angle_terms, dtype=np.float32)
+    slope = float(np.dot(angle_np, shifts_np) / max(np.dot(angle_np, angle_np), 1e-6))
+    baseline_term = max((1.0 / max(near_object_distance_m, 1e-3)) - (1.0 / max(far_object_distance_m, 1e-3)), 1e-6)
+    estimated_offset_m = abs(slope) / max(2000.0 * baseline_term, 1e-6)
+    residuals = shifts_np - slope * angle_np
+    residual_std = float(np.std(residuals)) if len(residuals) > 1 else 0.0
+    coverage_score = min(float(np.mean(match_counts)) / 80.0, 1.0)
+    residual_score = max(0.0, 1.0 - residual_std / 10.0)
+    confidence = max(0.0, min(1.0, 0.55 * coverage_score + 0.45 * residual_score))
+
+    return NodalOffset(
+        focal_length_mm=0.0,
+        offset_z=float(estimated_offset_m * 1000.0),
+        rotation_y=float(np.mean(rotation_angles_deg)),
+        confidence=confidence,
+        method="parallax-estimate",
     )

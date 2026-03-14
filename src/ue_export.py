@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Literal, Optional
 
-from calibration import LENSU_VERSION, LensProfile, normalized_focal_lengths
+from calibration import LENSU_VERSION, LensProfile, measured_focal_length_mm, normalized_focal_lengths
 from stmap import generate_stmap_from_calibration
 
 
@@ -28,6 +28,10 @@ def export_ue_json(
 
     output_path.mkdir(parents=True, exist_ok=True)
     stmap_directory = stmap_directory or output_path
+    breathing_summary = {
+        f"{item.nominal_focal_length_mm:.1f}mm": round(item.breathing_ratio(), 4)
+        for item in profile.breathing_profiles
+    }
     ue_data: dict[str, object] = {
         "data_mode": data_mode,
         "lens_info": {
@@ -40,13 +44,17 @@ def export_ue_json(
         "user_metadata": {
             "generator": "LensU",
             "version": LENSU_VERSION,
+            "breathing_ratio_by_focal_length": breathing_summary,
         },
         "distortion_table": [],
         "focal_length_table": [],
         "image_center_table": [],
         "nodal_offset_table": [],
         "st_map_table": [],
+        "breathing_profiles": [],
     }
+
+    calibration_lookup = {round(point.focal_length_mm, 3): point for point in profile.calibration_points}
 
     for point in profile.calibration_points:
         focus = 0.0
@@ -80,7 +88,6 @@ def export_ue_json(
                 (profile.image_width, profile.image_height),
                 stmap_directory / stmap_name,
             )
-        if data_mode == "STMap":
             ue_data["st_map_table"].append(
                 {
                     "focus": focus,
@@ -92,6 +99,42 @@ def export_ue_json(
                 }
             )
 
+    for breathing_profile in profile.breathing_profiles:
+        source_point = calibration_lookup.get(round(breathing_profile.nominal_focal_length_mm, 3))
+        source_fx = source_point.fx if source_point is not None else 0.0
+        source_fy = source_point.fy if source_point is not None else 0.0
+        source_measured = (
+            measured_focal_length_mm(source_point, profile.sensor_width_mm, profile.image_width)
+            if source_point is not None
+            else breathing_profile.nominal_focal_length_mm
+        )
+        source_measured = source_measured or breathing_profile.nominal_focal_length_mm
+        profile_payload = {
+            "nominal_focal_length_mm": breathing_profile.nominal_focal_length_mm,
+            "breathing_ratio": breathing_profile.breathing_ratio(),
+            "points": [],
+        }
+        for breathing_point in breathing_profile.points:
+            scale = breathing_point.measured_focal_length_mm / max(source_measured, 1e-6)
+            fx_scaled = source_fx * scale
+            fy_scaled = source_fy * scale
+            fx_norm = fx_scaled / profile.image_width if profile.image_width else 0.0
+            fy_norm = fy_scaled / profile.image_height if profile.image_height else 0.0
+            ue_data["focal_length_table"].append(
+                {
+                    "focus": breathing_point.focus_distance_m,
+                    "zoom": breathing_profile.nominal_focal_length_mm,
+                    "focal_length_info": {"fx_fy": [fx_norm, fy_norm]},
+                }
+            )
+            profile_payload["points"].append(
+                {
+                    "focus_distance_m": breathing_point.focus_distance_m,
+                    "measured_focal_length_mm": breathing_point.measured_focal_length_mm,
+                }
+            )
+        ue_data["breathing_profiles"].append(profile_payload)
+
     for offset in profile.nodal_offsets:
         ue_data["nodal_offset_table"].append(
             {
@@ -100,12 +143,14 @@ def export_ue_json(
                 "nodal_offset": {
                     "location_offset": [offset.offset_x, offset.offset_y, offset.offset_z],
                     "rotation_offset": [offset.rotation_x, offset.rotation_y, offset.rotation_z],
+                    "confidence": offset.confidence,
+                    "method": offset.method,
                 },
             }
         )
 
     json_path = output_path / f"{_safe_name(profile.lens_name)}_calibration.json"
-    json_path.write_text(json.dumps(ue_data, indent=2))
+    json_path.write_text(json.dumps(ue_data, indent=2), encoding="utf-8")
     return json_path
 
 
@@ -138,7 +183,9 @@ STMAP_PACKAGE_PATH = f"{{PACKAGE_PATH}}/STMaps"
 
 
 def import_texture(filename: str):
-    source_path = os.path.join(SCRIPT_DIR, filename)
+    source_path = os.path.join(SCRIPT_DIR, "stmaps", filename)
+    if not os.path.exists(source_path):
+        source_path = os.path.join(SCRIPT_DIR, filename)
     if not os.path.exists(source_path):
         unreal.log_warning(f"STMap source not found: {{source_path}}")
         return None

@@ -16,6 +16,7 @@ import streamlit.components.v1 as components
 
 from board_generator import generate_charuco_pdf, generate_checkerboard_pdf
 from calibration import (
+    BreathingPoint,
     CalibrationDiagnostics,
     CalibrationPoint,
     LensProfile,
@@ -27,10 +28,14 @@ from calibration import (
     compute_coverage_heatmap,
     detect_charuco,
     detect_checkerboard,
+    estimate_nodal_from_parallax,
     generate_barrel_pincushion_visualization,
     generate_distortion_grid,
+    lens_profile_from_dict,
+    measured_focal_length_mm,
     undistort_image,
 )
+from live_calibration import live_calibration_ui
 from ue_export import export_ue_json, export_ue_python_script
 from video_extractor import extract_frames_from_video, extract_frames_with_checkerboard
 
@@ -223,18 +228,7 @@ def _suggest_zoom_points(min_mm: float, max_mm: float) -> list[float]:
 
 def _load_profile_from_upload(payload: bytes) -> LensProfile:
     data = json.loads(payload)
-    loaded = LensProfile(
-        lens_name=data.get("lens_name", "Unknown"),
-        sensor_width_mm=data.get("sensor_width_mm", 36.0),
-        sensor_height_mm=data.get("sensor_height_mm", 24.0),
-        image_width=data.get("image_width", 1920),
-        image_height=data.get("image_height", 1080),
-    )
-    for point in data.get("calibration_points", []):
-        loaded.calibration_points.append(CalibrationPoint(**point))
-    for offset in data.get("nodal_offsets", []):
-        loaded.nodal_offsets.append(NodalOffset(**offset))
-    return loaded
+    return lens_profile_from_dict(data)
 
 
 def _copy_text_button(label: str, text: str, key: str) -> None:
@@ -516,19 +510,83 @@ def _compare_profiles(current: LensProfile, other: LensProfile) -> list[dict[str
                 "rotation_z_diff": (offset_b.rotation_z - offset_a.rotation_z) if offset_a and offset_b else None,
             }
         )
+
+    current_breathing = {
+        round(profile.nominal_focal_length_mm, 3): profile for profile in current.breathing_profiles
+    }
+    other_breathing = {
+        round(profile.nominal_focal_length_mm, 3): profile for profile in other.breathing_profiles
+    }
+    for focal in sorted(set(current_breathing) | set(other_breathing)):
+        profile_a = current_breathing.get(focal)
+        profile_b = other_breathing.get(focal)
+        rows.append(
+            {
+                "type": "Breathing",
+                "focal_length_mm": focal,
+                "ratio_diff": (
+                    profile_b.breathing_ratio() - profile_a.breathing_ratio()
+                    if profile_a and profile_b
+                    else None
+                ),
+                "points_a": len(profile_a.points) if profile_a else 0,
+                "points_b": len(profile_b.points) if profile_b else 0,
+            }
+        )
     return rows
+
+
+def _focus_display_label(distance_m: float) -> str:
+    if distance_m >= 999.0:
+        return "Infinity"
+    return f"{distance_m:.2f} m"
+
+
+def _render_breathing_chart(profile) -> None:
+    chart_values: list[dict[str, Any]] = []
+    for point in profile.points:
+        chart_values.append(
+            {
+                "focus_distance_m": point.focus_distance_m,
+                "measured_focal_length_mm": point.measured_focal_length_mm,
+                "focus_label": _focus_display_label(point.focus_distance_m),
+            }
+        )
+    if not chart_values:
+        return
+    st.vega_lite_chart(
+        {
+            "data": {"values": chart_values},
+            "mark": {"type": "line", "point": True},
+            "encoding": {
+                "x": {"field": "focus_distance_m", "type": "quantitative", "title": "Focus Distance (m)"},
+                "y": {
+                    "field": "measured_focal_length_mm",
+                    "type": "quantitative",
+                    "title": "Measured Focal Length (mm)",
+                },
+                "tooltip": [
+                    {"field": "focus_label", "type": "nominal", "title": "Focus"},
+                    {"field": "measured_focal_length_mm", "type": "quantitative", "title": "Measured mm"},
+                ],
+            },
+            "height": 280,
+        },
+        use_container_width=True,
+    )
 
 
 def _prepare_export_bundle(profile: LensProfile, data_mode: str, include_stmaps: bool) -> dict[str, Any]:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
         stmap_dir = tmp_path / "stmaps"
+        package_stmaps = include_stmaps or data_mode == "STMap"
         json_path = export_ue_json(
             profile,
             tmp_path,
             data_mode=data_mode,
             stmap_directory=stmap_dir,
-            include_stmaps=include_stmaps,
+            include_stmaps=package_stmaps,
         )
         script_path = export_ue_python_script(profile, json_path.name, tmp_path, data_mode=data_mode)
 
@@ -536,7 +594,7 @@ def _prepare_export_bundle(profile: LensProfile, data_mode: str, include_stmaps:
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
             archive.write(json_path, json_path.name)
             archive.write(script_path, script_path.name)
-            if include_stmaps and stmap_dir.exists():
+            if package_stmaps and stmap_dir.exists():
                 for stmap_file in sorted(stmap_dir.iterdir()):
                     archive.write(stmap_file, f"stmaps/{stmap_file.name}")
         zip_bytes = zip_buffer.getvalue()
@@ -687,8 +745,16 @@ def main() -> None:
         "charuco_dictionary": int(dictionary_names[charuco_dictionary_name]),
     }
 
-    tab_calibrate, tab_video, tab_nodal, tab_profile, tab_export = st.tabs(
-        ["Distortion Calibration", "Video Calibration", "Nodal Offset", "Lens Profile", "UE Export"]
+    tab_calibrate, tab_live, tab_video, tab_breathing, tab_nodal, tab_profile, tab_export = st.tabs(
+        [
+            "Distortion Calibration",
+            "Live Calibration",
+            "Video Calibration",
+            "Lens Breathing",
+            "Nodal Offset",
+            "Lens Profile",
+            "UE Export",
+        ]
     )
 
     with tab_calibrate:
@@ -756,6 +822,27 @@ def main() -> None:
         current_run = st.session_state.calibration_runs.get(_run_key(float(focal_length)))
         if current_run:
             _render_calibration_visuals(current_run)
+
+    with tab_live:
+        live_focal_length = st.number_input(
+            "Live Calibration Focal Length (mm)",
+            value=50.0,
+            step=1.0,
+            format="%.1f",
+            key="live_focal",
+            help="Focal length represented by the live capture set.",
+        )
+        live_result = live_calibration_ui(float(live_focal_length), detection_mode, settings)
+        if live_result:
+            point = live_result["point"]
+            diagnostics = live_result["diagnostics"]
+            files = live_result["files"]
+            profile.add_calibration(point)
+            if diagnostics.image_size:
+                profile.image_width, profile.image_height = diagnostics.image_size
+            _store_run(float(live_focal_length), detection_mode, point, diagnostics, files, settings)
+            _save_profile(profile)
+            st.success(f"Live calibration complete. RMS: {point.rms_error:.4f}px.")
 
     with tab_video:
         st.header("Video Calibration")
@@ -910,10 +997,93 @@ def main() -> None:
             if current_video_run:
                 _render_calibration_visuals(current_video_run)
 
+    with tab_breathing:
+        st.header("Lens Breathing")
+        st.info(
+            "Measure effective focal length at multiple focus distances for the same nominal focal length. LensU stores the curve and exports it as focus-indexed focal data for Unreal."
+        )
+        breathing_nominal = st.number_input(
+            "Nominal Focal Length (mm)",
+            value=50.0,
+            step=1.0,
+            format="%.1f",
+            key="breathing_nominal",
+        )
+        focus_presets = {"Infinity": 1000.0, "3m": 3.0, "1.5m": 1.5, "1m": 1.0, "0.5m": 0.5}
+        selected_focus_label = st.selectbox("Focus Distance", list(focus_presets.keys()), key="breathing_focus")
+        selected_focus_m = float(focus_presets[selected_focus_label])
+        breathing_uploads = st.file_uploader(
+            "Upload breathing calibration images",
+            type=["jpg", "jpeg", "png", "bmp", "tiff"],
+            accept_multiple_files=True,
+            key="breathing_images",
+            help="Capture a focused checkerboard/ChArUco set at this focus distance and solve effective focal length from it.",
+        )
+
+        if breathing_uploads and st.button("Measure Breathing Point", type="primary"):
+            with st.spinner("Measuring effective focal length..."):
+                point, diagnostics, _ = _calibrate_files(
+                    breathing_uploads,
+                    focal_length=float(breathing_nominal),
+                    mode=detection_mode,
+                    checkerboard_pattern=settings["checkerboard_pattern"],
+                    checker_square_mm=settings["checker_square_mm"],
+                    charuco_board_size=settings["charuco_board_size"],
+                    charuco_square_mm=settings["charuco_square_mm"],
+                    charuco_marker_mm=settings["charuco_marker_mm"],
+                    charuco_dictionary=settings["charuco_dictionary"],
+                )
+            if point is None:
+                st.error("Breathing measurement failed. Capture more diverse, sharper board views.")
+            else:
+                measured_mm = measured_focal_length_mm(point, profile.sensor_width_mm, diagnostics.image_size[0])
+                profile.add_breathing_point(
+                    BreathingPoint(
+                        focus_distance_m=selected_focus_m,
+                        measured_focal_length_mm=measured_mm,
+                        nominal_focal_length_mm=float(breathing_nominal),
+                    )
+                )
+                _save_profile(profile)
+                st.success(
+                    f"Saved breathing point at {_focus_display_label(selected_focus_m)}: {measured_mm:.2f} mm effective focal length."
+                )
+
+        breathing_profile = next(
+            (
+                item
+                for item in profile.breathing_profiles
+                if abs(item.nominal_focal_length_mm - float(breathing_nominal)) <= 0.1
+            ),
+            None,
+        )
+        if breathing_profile and breathing_profile.points:
+            metric_cols = st.columns(3)
+            metric_cols[0].metric("Samples", str(len(breathing_profile.points)))
+            metric_cols[1].metric("Breathing Ratio", f"{breathing_profile.breathing_ratio():.2f}%")
+            metric_cols[2].metric(
+                "Range",
+                f"{min(point.measured_focal_length_mm for point in breathing_profile.points):.2f}-{max(point.measured_focal_length_mm for point in breathing_profile.points):.2f} mm",
+            )
+            _render_breathing_chart(breathing_profile)
+            st.dataframe(
+                [
+                    {
+                        "focus": _focus_display_label(point.focus_distance_m),
+                        "focus_distance_m": point.focus_distance_m,
+                        "measured_focal_length_mm": round(point.measured_focal_length_mm, 3),
+                    }
+                    for point in breathing_profile.points
+                ],
+                use_container_width=True,
+            )
+        else:
+            st.caption("No breathing samples yet. Start with Infinity, 3m, 1.5m, 1m, and 0.5m.")
+
     with tab_nodal:
         st.header("Nodal Offset")
         st.info(
-            "Measure these manually if you have a nodal rail or entrance-pupil test. LensU stores them per focal length for UE import."
+            "Save manual nodal offsets, or run a guided parallax test from five uploaded photos for a rough entrance-pupil estimate."
         )
 
         nodal_focal = st.number_input(
@@ -993,9 +1163,53 @@ def main() -> None:
             _save_profile(profile)
             st.success(f"Nodal offset saved for {nodal_focal:.1f}mm.")
 
+        st.divider()
+        st.subheader("Guided Nodal Offset Test")
+        st.markdown(
+            """
+1. Mount the camera on a tripod head with calibrated distance markings.
+2. Place two vertical objects at different distances, ideally near `1m` and `3m`.
+3. Rotate the camera and watch the parallax between the near and far object.
+4. Capture frames at `-10°`, `-5°`, `0°`, `+5°`, and `+10°`.
+5. Upload all five images below.
+6. LensU estimates the entrance pupil shift and confidence from the parallax trend.
+            """
+        )
+        near_distance = st.number_input("Near Object Distance (m)", value=1.0, step=0.1, format="%.1f")
+        far_distance = st.number_input("Far Object Distance (m)", value=3.0, step=0.1, format="%.1f")
+        nodal_test_uploads = st.file_uploader(
+            "Upload 5 parallax test photos",
+            type=["jpg", "jpeg", "png", "bmp", "tiff"],
+            accept_multiple_files=True,
+            key="guided_nodal_uploads",
+        )
+
+        if nodal_test_uploads:
+            st.caption("Expected order: -10°, -5°, 0°, +5°, +10°.")
+        if nodal_test_uploads and st.button("Estimate From Parallax", type="primary"):
+            if len(nodal_test_uploads) != 5:
+                st.error("Upload exactly 5 images for the guided nodal test.")
+            else:
+                images = [_bytes_to_image(upload.getvalue()) for upload in nodal_test_uploads]
+                if any(image is None for image in images):
+                    st.error("At least one uploaded nodal-test image could not be decoded.")
+                else:
+                    estimate = estimate_nodal_from_parallax(
+                        images=[image for image in images if image is not None],
+                        rotation_angles_deg=[-10.0, -5.0, 0.0, 5.0, 10.0],
+                        near_object_distance_m=float(near_distance),
+                        far_object_distance_m=float(far_distance),
+                    )
+                    estimate.focal_length_mm = float(nodal_focal)
+                    profile.add_nodal_offset(estimate)
+                    _save_profile(profile)
+                    st.success(
+                        f"Estimated nodal Z offset: {estimate.offset_z:.2f} mm | confidence {estimate.confidence:.2f}"
+                    )
+
     with tab_profile:
         st.header("Lens Profile")
-        if not profile.calibration_points and not profile.nodal_offsets:
+        if not profile.calibration_points and not profile.nodal_offsets and not profile.breathing_profiles:
             st.warning("No calibration data recorded yet.")
         else:
             if profile.calibration_points:
@@ -1051,10 +1265,32 @@ def main() -> None:
                     st.write(
                         f"{offset.focal_length_mm:.1f}mm | "
                         f"Loc ({offset.offset_x:.2f}, {offset.offset_y:.2f}, {offset.offset_z:.2f}) mm | "
-                        f"Rot ({offset.rotation_x:.2f}, {offset.rotation_y:.2f}, {offset.rotation_z:.2f}) deg"
+                        f"Rot ({offset.rotation_x:.2f}, {offset.rotation_y:.2f}, {offset.rotation_z:.2f}) deg | "
+                        f"Confidence {offset.confidence:.2f} | {offset.method}"
                     )
             else:
                 st.caption("No nodal offsets recorded.")
+
+            st.subheader("Breathing Profiles")
+            if profile.breathing_profiles:
+                for breathing_profile in profile.breathing_profiles:
+                    with st.expander(
+                        f"{breathing_profile.nominal_focal_length_mm:.1f}mm | {breathing_profile.breathing_ratio():.2f}% breathing"
+                    ):
+                        _render_breathing_chart(breathing_profile)
+                        st.dataframe(
+                            [
+                                {
+                                    "focus": _focus_display_label(point.focus_distance_m),
+                                    "focus_distance_m": point.focus_distance_m,
+                                    "measured_focal_length_mm": round(point.measured_focal_length_mm, 3),
+                                }
+                                for point in breathing_profile.points
+                            ],
+                            use_container_width=True,
+                        )
+            else:
+                st.caption("No breathing profiles recorded.")
 
             st.divider()
             st.subheader("Profile Comparison")
