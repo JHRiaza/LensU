@@ -1,19 +1,34 @@
-"""LensU — Unreal Engine export module.
+"""LensU Unreal Engine export helpers."""
 
-Generates:
-1. A calibration JSON file with all lens data
-2. A UE Python script that creates a .ulens asset from the JSON
-"""
+from __future__ import annotations
 
 import json
 from pathlib import Path
-from calibration import LensProfile
+from typing import Literal, Optional
+
+from calibration import LENSU_VERSION, LensProfile, normalized_focal_lengths
+from stmap import generate_stmap_from_calibration
 
 
-def export_ue_json(profile: LensProfile, output_path: Path) -> Path:
-    """Export lens profile as UE-compatible JSON."""
-    
-    ue_data = {
+DataMode = Literal["Parameters", "STMap"]
+
+
+def _safe_name(name: str) -> str:
+    return name.replace(" ", "_")
+
+
+def export_ue_json(
+    profile: LensProfile,
+    output_path: Path,
+    data_mode: DataMode = "Parameters",
+    stmap_directory: Optional[Path] = None,
+) -> Path:
+    """Export lens profile as UE-oriented JSON."""
+
+    output_path.mkdir(parents=True, exist_ok=True)
+    stmap_directory = stmap_directory or output_path
+    ue_data: dict[str, object] = {
+        "data_mode": data_mode,
         "lens_info": {
             "lens_name": profile.lens_name,
             "sensor_width_mm": profile.sensor_width_mm,
@@ -21,113 +36,139 @@ def export_ue_json(profile: LensProfile, output_path: Path) -> Path:
             "image_width": profile.image_width,
             "image_height": profile.image_height,
         },
+        "user_metadata": {
+            "generator": "LensU",
+            "version": LENSU_VERSION,
+        },
         "distortion_table": [],
         "focal_length_table": [],
         "image_center_table": [],
         "nodal_offset_table": [],
+        "st_map_table": [],
     }
 
     for point in profile.calibration_points:
-        # Focus=0 (infinity), Zoom=focal_length (UE convention)
         focus = 0.0
         zoom = point.focal_length_mm
+        fx_norm, fy_norm = normalized_focal_lengths(point, (profile.image_width, profile.image_height))
+        focal_length_info = {"fx_fy": [fx_norm, fy_norm]}
 
-        ue_data["distortion_table"].append({
-            "focus": focus,
-            "zoom": zoom,
-            "distortion_info": {
-                "parameters": [point.k1, point.k2, point.p1, point.p2, point.k3],
-            },
-            "focal_length_info": {
-                "fx": point.fx,
-                "fy": point.fy,
-            },
-        })
+        ue_data["distortion_table"].append(
+            {
+                "focus": focus,
+                "zoom": zoom,
+                "distortion_info": {"parameters": [point.k1, point.k2, point.p1, point.p2, point.k3]},
+                "focal_length_info": focal_length_info,
+            }
+        )
+        ue_data["focal_length_table"].append(
+            {"focus": focus, "zoom": zoom, "focal_length_info": focal_length_info}
+        )
+        ue_data["image_center_table"].append(
+            {
+                "focus": focus,
+                "zoom": zoom,
+                "image_center_info": {"principal_point": [point.cx, point.cy]},
+            }
+        )
 
-        ue_data["focal_length_table"].append({
-            "focus": focus,
-            "zoom": zoom,
-            "focal_length_info": {
-                "fx": point.fx,
-                "fy": point.fy,
-            },
-        })
-
-        ue_data["image_center_table"].append({
-            "focus": focus,
-            "zoom": zoom,
-            "image_center": {
-                "cx": point.cx,
-                "cy": point.cy,
-            },
-        })
+        if data_mode == "STMap":
+            stmap_name = f"{_safe_name(profile.lens_name)}_{zoom:.1f}mm_stmap.exr"
+            stmap_path = generate_stmap_from_calibration(
+                point,
+                (profile.image_width, profile.image_height),
+                stmap_directory / stmap_name,
+            )
+            ue_data["st_map_table"].append(
+                {
+                    "focus": focus,
+                    "zoom": zoom,
+                    "st_map_info": {
+                        "distortion_map": stmap_path.name,
+                        "map_format": "RGBA",
+                    },
+                }
+            )
 
     for offset in profile.nodal_offsets:
-        focus = 0.0
-        zoom = offset.focal_length_mm
+        ue_data["nodal_offset_table"].append(
+            {
+                "focus": 0.0,
+                "zoom": offset.focal_length_mm,
+                "nodal_offset": {
+                    "location_offset": [offset.offset_x, offset.offset_y, offset.offset_z],
+                    "rotation_offset": [offset.rotation_x, offset.rotation_y, offset.rotation_z],
+                },
+            }
+        )
 
-        ue_data["nodal_offset_table"].append({
-            "focus": focus,
-            "zoom": zoom,
-            "offset": {
-                "location_x": offset.offset_x,
-                "location_y": offset.offset_y,
-                "location_z": offset.offset_z,
-                "rotation_x": offset.rotation_x,
-                "rotation_y": offset.rotation_y,
-                "rotation_z": offset.rotation_z,
-            },
-        })
-
-    json_path = output_path / f"{profile.lens_name.replace(' ', '_')}_calibration.json"
+    json_path = output_path / f"{_safe_name(profile.lens_name)}_calibration.json"
     json_path.write_text(json.dumps(ue_data, indent=2))
     return json_path
 
 
-def export_ue_python_script(profile: LensProfile, json_filename: str, output_path: Path) -> Path:
-    """Generate a UE Python script that imports the JSON into a .ulens asset.
-    
-    This script is meant to be run inside UE's Python console or via
-    Edit > Developer Tools > Python (UE 5.6+).
-    """
-    
+def export_ue_python_script(
+    profile: LensProfile,
+    json_filename: str,
+    output_path: Path,
+    data_mode: DataMode = "Parameters",
+) -> Path:
+    """Generate a UE Python import script for the exported JSON."""
+
     script = f'''"""
-LensU — Auto-generated Unreal Engine import script
+LensU auto-generated Unreal Engine import script.
 Lens: {profile.lens_name}
-Generated by LensU
-
-Instructions:
-1. Copy this script and the JSON file to your UE project
-2. Open UE Editor > Tools > Execute Python Script (or Python console)
-3. Run this script — it will create a LensFile asset in /Game/LensU/
-
-Requires: Camera Calibration plugin enabled
-Compatible with: UE 5.6+
+Data mode: {data_mode}
 """
 
-import unreal
 import json
 import os
 
-# --- Configuration ---
+import unreal
+
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 JSON_PATH = os.path.join(SCRIPT_DIR, "{json_filename}")
-ASSET_NAME = "{profile.lens_name.replace(' ', '_')}"
-ASSET_PATH = f"/Game/LensU/{{ASSET_NAME}}"
+ASSET_NAME = "{_safe_name(profile.lens_name)}"
+PACKAGE_PATH = "/Game/LensU"
+ASSET_PATH = f"{{PACKAGE_PATH}}/{{ASSET_NAME}}"
+STMAP_PACKAGE_PATH = f"{{PACKAGE_PATH}}/STMaps"
+
+
+def import_texture(filename: str):
+    source_path = os.path.join(SCRIPT_DIR, filename)
+    if not os.path.exists(source_path):
+        unreal.log_warning(f"STMap source not found: {{source_path}}")
+        return None
+
+    task = unreal.AssetImportTask()
+    task.filename = source_path
+    task.destination_path = STMAP_PACKAGE_PATH
+    task.automated = True
+    task.save = True
+    task.replace_existing = True
+    unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
+
+    asset_name = os.path.splitext(os.path.basename(filename))[0]
+    asset = unreal.EditorAssetLibrary.load_asset(f"{{STMAP_PACKAGE_PATH}}/{{asset_name}}")
+    if asset is not None:
+        try:
+            asset.compression_settings = unreal.TextureCompressionSettings.TC_HDR
+            asset.srgb = False
+            unreal.EditorAssetLibrary.save_loaded_asset(asset)
+        except Exception as exc:
+            unreal.log_warning(f"Unable to tweak STMap texture settings: {{exc}}")
+    return asset
 
 
 def create_lens_file():
-    """Create a ULensFile asset from LensU calibration data."""
+    with open(JSON_PATH, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
 
-    # Load calibration JSON
-    with open(JSON_PATH, "r") as f:
-        data = json.load(f)
-
-    # Create the asset
     asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
     lens_file = asset_tools.create_asset(
         asset_name=ASSET_NAME,
-        package_path="/Game/LensU",
+        package_path=PACKAGE_PATH,
         asset_class=unreal.LensFile,
         factory=unreal.LensFileFactory(),
     )
@@ -136,78 +177,62 @@ def create_lens_file():
         unreal.log_error("Failed to create LensFile asset")
         return
 
-    # Set lens info
-    lens_info = data.get("lens_info", {{}})
-    unreal.log(f"Importing lens: {{lens_info.get('lens_name', 'Unknown')}}")
+    lens_file.user_metadata = data.get("user_metadata", {{}})
+    if data.get("data_mode") == "STMap":
+        lens_file.data_mode = unreal.LensDataMode.ST_MAP
+    else:
+        lens_file.data_mode = unreal.LensDataMode.PARAMETERS
 
-    # Import distortion data
     for entry in data.get("distortion_table", []):
-        focus = entry["focus"]
-        zoom = entry["zoom"]
-        params = entry["distortion_info"]["parameters"]
-        fl = entry["focal_length_info"]
-
         distortion_info = unreal.DistortionInfo()
-        distortion_info.parameters = params
+        distortion_info.parameters = entry["distortion_info"]["parameters"]
 
+        fx, fy = entry["focal_length_info"]["fx_fy"]
         focal_length_info = unreal.FocalLengthInfo()
-        focal_length_info.fx_fy = unreal.Vector2D(fl["fx"], fl["fy"])
+        focal_length_info.fx_fy = unreal.Vector2D(fx, fy)
+        lens_file.add_distortion_point(entry["focus"], entry["zoom"], distortion_info, focal_length_info)
 
-        lens_file.add_distortion_point(focus, zoom, distortion_info, focal_length_info)
-
-    # Import focal length data
     for entry in data.get("focal_length_table", []):
-        focus = entry["focus"]
-        zoom = entry["zoom"]
-        fl = entry["focal_length_info"]
-
+        fx, fy = entry["focal_length_info"]["fx_fy"]
         focal_length_info = unreal.FocalLengthInfo()
-        focal_length_info.fx_fy = unreal.Vector2D(fl["fx"], fl["fy"])
+        focal_length_info.fx_fy = unreal.Vector2D(fx, fy)
+        lens_file.add_focal_length_point(entry["focus"], entry["zoom"], focal_length_info)
 
-        lens_file.add_focal_length_point(focus, zoom, focal_length_info)
-
-    # Import image center data
     for entry in data.get("image_center_table", []):
-        focus = entry["focus"]
-        zoom = entry["zoom"]
-        center = entry["image_center"]
-
+        cx, cy = entry["image_center_info"]["principal_point"]
         image_center_info = unreal.ImageCenterInfo()
-        image_center_info.principal_point = unreal.Vector2D(center["cx"], center["cy"])
+        image_center_info.principal_point = unreal.Vector2D(cx, cy)
+        lens_file.add_image_center_point(entry["focus"], entry["zoom"], image_center_info)
 
-        lens_file.add_image_center_point(focus, zoom, image_center_info)
-
-    # Import nodal offset data
     for entry in data.get("nodal_offset_table", []):
-        focus = entry["focus"]
-        zoom = entry["zoom"]
-        offset = entry["offset"]
-
+        location = entry["nodal_offset"]["location_offset"]
+        rotation = entry["nodal_offset"]["rotation_offset"]
         nodal_offset = unreal.NodalPointOffset()
-        nodal_offset.location_offset = unreal.Vector(
-            offset["location_x"],
-            offset["location_y"],
-            offset["location_z"],
-        )
-        nodal_offset.rotation_offset = unreal.Rotator(
-            offset["rotation_x"],
-            offset["rotation_y"],
-            offset["rotation_z"],
-        )
+        nodal_offset.location_offset = unreal.Vector(location[0], location[1], location[2])
+        nodal_offset.rotation_offset = unreal.Rotator(rotation[0], rotation[1], rotation[2])
+        lens_file.add_nodal_offset_point(entry["focus"], entry["zoom"], nodal_offset)
 
-        lens_file.add_nodal_offset_point(focus, zoom, nodal_offset)
+    for entry in data.get("st_map_table", []):
+        texture = import_texture(entry["st_map_info"]["distortion_map"])
+        if texture is None:
+            continue
+        st_map_info = unreal.STMapInfo()
+        st_map_info.distortion_map = texture
+        try:
+            st_map_info.map_format = unreal.CalibratedMapFormat.RGBA
+        except Exception:
+            pass
+        lens_file.add_st_map_point(entry["focus"], entry["zoom"], st_map_info)
 
-    # Save
     unreal.EditorAssetLibrary.save_asset(ASSET_PATH)
     unreal.log(f"LensFile created at {{ASSET_PATH}}")
-    unreal.log(f"Distortion points: {{len(data.get('distortion_table', []))}}")
-    unreal.log(f"Nodal offset points: {{len(data.get('nodal_offset_table', []))}}")
 
 
 if __name__ == "__main__":
     create_lens_file()
 '''
 
-    script_path = output_path / f"import_{profile.lens_name.replace(' ', '_')}_to_ue.py"
-    script_path.write_text(script)
+    output_path.mkdir(parents=True, exist_ok=True)
+    script_path = output_path / f"import_{_safe_name(profile.lens_name)}_to_ue.py"
+    script_path.write_text(script, encoding="utf-8")
     return script_path
