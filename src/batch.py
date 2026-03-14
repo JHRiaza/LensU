@@ -12,6 +12,7 @@ from calibration import (
     CalibrationDiagnostics,
     CalibrationPoint,
     LensProfile,
+    calibrate_anamorphic_detailed,
     calibrate_from_charuco_images,
     calibrate_from_images,
 )
@@ -67,12 +68,26 @@ def _calibrate_folder(
     pattern_size: tuple[int, int],
     square_size_mm: float,
     detection_mode: str,
+    anamorphic_enabled: bool = False,
+    squeeze_ratio: float = 2.0,
+    anamorphic_desqueezed: bool = False,
 ) -> tuple[CalibrationPoint | None, CalibrationDiagnostics, int]:
     image_paths = [
         path for path in sorted(folder.iterdir()) if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
     ]
     if not image_paths:
         return None, CalibrationDiagnostics(image_size=None), 0
+
+    if anamorphic_enabled and detection_mode.lower() != "charuco":
+        point, diagnostics, _ = calibrate_anamorphic_detailed(
+            image_paths,
+            pattern_size=pattern_size,
+            square_size_mm=square_size_mm,
+            focal_length_mm=focal_length_mm,
+            squeeze_ratio=squeeze_ratio,
+            desqueezed=anamorphic_desqueezed,
+        )
+        return point, diagnostics, len(image_paths)
 
     if detection_mode.lower() == "charuco":
         marker_length = square_size_mm * 0.75
@@ -106,6 +121,9 @@ def batch_calibrate_detailed(
     sensor_width_mm: float = 36.0,
     sensor_height_mm: float = 24.0,
     progress_callback: ProgressCallback | None = None,
+    anamorphic_enabled: bool = False,
+    squeeze_ratio: float = 2.0,
+    anamorphic_desqueezed: bool = False,
 ) -> tuple[LensProfile, list[BatchFolderResult]]:
     """Batch calibrate from focal-length subfolders and return detailed results."""
 
@@ -124,6 +142,9 @@ def batch_calibrate_detailed(
             pattern_size,
             square_size_mm,
             detection_mode,
+            anamorphic_enabled=anamorphic_enabled,
+            squeeze_ratio=squeeze_ratio,
+            anamorphic_desqueezed=anamorphic_desqueezed,
         )
         used_count = sum(1 for item in diagnostics.image_results if item.used)
         if point is None:
@@ -163,6 +184,9 @@ def batch_calibrate(
     detection_mode: str = "checkerboard",
     sensor_width_mm: float = 36.0,
     sensor_height_mm: float = 24.0,
+    anamorphic_enabled: bool = False,
+    squeeze_ratio: float = 2.0,
+    anamorphic_desqueezed: bool = False,
 ) -> LensProfile:
     """Batch calibrate from a folder structure and return a combined LensProfile."""
 
@@ -173,6 +197,9 @@ def batch_calibrate(
         detection_mode=detection_mode,
         sensor_width_mm=sensor_width_mm,
         sensor_height_mm=sensor_height_mm,
+        anamorphic_enabled=anamorphic_enabled,
+        squeeze_ratio=squeeze_ratio,
+        anamorphic_desqueezed=anamorphic_desqueezed,
     )
     if not profile.calibration_points:
         raise RuntimeError("Batch calibration completed with no successful focal lengths.")

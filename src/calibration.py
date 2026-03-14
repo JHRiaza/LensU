@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -12,7 +13,7 @@ import cv2
 import numpy as np
 
 
-LENSU_VERSION = "v1.0"
+LENSU_VERSION = "v1.3"
 
 
 @dataclass
@@ -32,6 +33,16 @@ class CalibrationPoint:
     rms_error: float = 0.0
     num_images: int = 0
     detection_mode: str = "Checkerboard"
+    anamorphic_desqueezed: Optional[dict[str, float]] = None
+    anamorphic_squeezed: Optional[dict[str, float]] = None
+
+
+@dataclass
+class AnamorphicInfo:
+    """Anamorphic lens parameters."""
+
+    squeeze_ratio: float = 2.0
+    desqueeze_applied: bool = False
 
 
 @dataclass
@@ -84,6 +95,7 @@ class LensProfile:
     calibration_points: list[CalibrationPoint] = field(default_factory=list)
     nodal_offsets: list[NodalOffset] = field(default_factory=list)
     breathing_profiles: list[BreathingProfile] = field(default_factory=list)
+    anamorphic: Optional[AnamorphicInfo] = None
 
     def add_calibration(self, point: CalibrationPoint) -> None:
         self.calibration_points = [
@@ -185,6 +197,9 @@ def lens_profile_from_dict(data: dict) -> LensProfile:
                 points=[BreathingPoint(**point) for point in breathing.get("points", [])],
             )
         )
+    anamorphic = data.get("anamorphic")
+    if isinstance(anamorphic, dict):
+        profile.anamorphic = AnamorphicInfo(**anamorphic)
     profile.calibration_points.sort(key=lambda point: point.focal_length_mm)
     profile.nodal_offsets.sort(key=lambda point: point.focal_length_mm)
     profile.breathing_profiles.sort(key=lambda point: point.nominal_focal_length_mm)
@@ -197,6 +212,63 @@ def aruco_available() -> bool:
 
 def _decode_image(image_path: Path) -> Optional[np.ndarray]:
     return cv2.imread(str(image_path))
+
+
+def _encode_image_path(image: np.ndarray, output_path: Path) -> None:
+    suffix = output_path.suffix.lower() or ".png"
+    extension = ".png" if suffix not in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"} else suffix
+    success, encoded = cv2.imencode(extension, image)
+    if not success:
+        raise RuntimeError(f"Failed to encode transformed image: {output_path.name}")
+    output_path.write_bytes(encoded.tobytes())
+
+
+def _scale_image_horizontally(image: np.ndarray, scale: float) -> np.ndarray:
+    if scale <= 0:
+        raise ValueError("Horizontal scale must be positive.")
+    width = max(int(round(image.shape[1] * scale)), 1)
+    interpolation = cv2.INTER_CUBIC if scale >= 1.0 else cv2.INTER_AREA
+    return cv2.resize(image, (width, image.shape[0]), interpolation=interpolation)
+
+
+def _write_scaled_images(image_paths: list[Path], scale: float, output_dir: Path) -> list[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    transformed_paths: list[Path] = []
+    for index, path in enumerate(image_paths):
+        image = _decode_image(path)
+        if image is None:
+            continue
+        transformed = _scale_image_horizontally(image, scale)
+        target_path = output_dir / f"{index:03d}_{path.stem}.png"
+        _encode_image_path(transformed, target_path)
+        transformed_paths.append(target_path)
+    return transformed_paths
+
+
+def _anamorphic_payload(point: CalibrationPoint) -> dict[str, float]:
+    return {
+        "k1": point.k1,
+        "k2": point.k2,
+        "p1": point.p1,
+        "p2": point.p2,
+        "k3": point.k3,
+        "cx": point.cx,
+        "cy": point.cy,
+        "fx": point.fx,
+        "fy": point.fy,
+        "rms_error": point.rms_error,
+    }
+
+
+def _merge_anamorphic_points(
+    desqueezed_point: CalibrationPoint,
+    squeezed_point: CalibrationPoint,
+    squeeze_ratio: float,
+) -> CalibrationPoint:
+    desqueezed_point.anamorphic_desqueezed = _anamorphic_payload(desqueezed_point)
+    desqueezed_point.anamorphic_squeezed = _anamorphic_payload(squeezed_point)
+    desqueezed_point.detection_mode = f"{desqueezed_point.detection_mode} (Anamorphic {squeeze_ratio:.2f}x)"
+    return desqueezed_point
 
 
 def _create_checkerboard_object_points(
@@ -399,6 +471,89 @@ def calibrate_from_images(
         num_images=len(obj_points),
     )
     return point, diagnostics
+
+
+def calibrate_anamorphic_detailed(
+    image_paths: list[Path],
+    pattern_size: tuple[int, int] = (9, 6),
+    square_size_mm: float = 25.0,
+    focal_length_mm: float = 50.0,
+    squeeze_ratio: float = 2.0,
+    desqueezed: bool = False,
+) -> tuple[Optional[CalibrationPoint], CalibrationDiagnostics, CalibrationDiagnostics]:
+    """Calibrate an anamorphic lens and keep both squeezed and desqueezed fits."""
+
+    if squeeze_ratio <= 0:
+        raise ValueError("Squeeze ratio must be positive.")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_dir = Path(tmpdir)
+        if desqueezed:
+            desqueezed_paths = image_paths
+            squeezed_paths = _write_scaled_images(image_paths, 1.0 / squeeze_ratio, temp_dir / "squeezed")
+        else:
+            squeezed_paths = image_paths
+            desqueezed_paths = _write_scaled_images(image_paths, squeeze_ratio, temp_dir / "desqueezed")
+
+        if not desqueezed_paths or not squeezed_paths:
+            empty = CalibrationDiagnostics(image_size=None)
+            return None, empty, empty
+
+        desqueezed_point, desqueezed_diagnostics = calibrate_from_images(
+            desqueezed_paths,
+            pattern_size=pattern_size,
+            square_size_mm=square_size_mm,
+            focal_length_mm=focal_length_mm,
+        )
+        squeezed_point, squeezed_diagnostics = calibrate_from_images(
+            squeezed_paths,
+            pattern_size=pattern_size,
+            square_size_mm=square_size_mm,
+            focal_length_mm=focal_length_mm,
+        )
+
+    if desqueezed_point is None or squeezed_point is None:
+        return None, desqueezed_diagnostics, squeezed_diagnostics
+
+    return (
+        _merge_anamorphic_points(desqueezed_point, squeezed_point, squeeze_ratio),
+        desqueezed_diagnostics,
+        squeezed_diagnostics,
+    )
+
+
+def calibrate_anamorphic(
+    image_paths: list[Path],
+    pattern_size: tuple[int, int] = (9, 6),
+    square_size_mm: float = 25.0,
+    focal_length_mm: float = 50.0,
+    squeeze_ratio: float = 2.0,
+    desqueezed: bool = False,
+) -> tuple[Optional[CalibrationPoint], list[bool]]:
+    """Calibrate an anamorphic lens.
+
+    If images are NOT desqueezed:
+      1. Desqueeze images horizontally by `squeeze_ratio`
+      2. Run standard calibration on the desqueezed set
+      3. Also solve a squeezed-space fit for reporting
+
+    If images ARE already desqueezed:
+      1. Run standard calibration directly
+      2. Re-squeeze copies of the input to recover squeezed-space parameters
+
+    The returned `CalibrationPoint` stores the desqueezed parameters, which are
+    the values Unreal Engine should use for the CG render.
+    """
+
+    point, diagnostics, _ = calibrate_anamorphic_detailed(
+        image_paths=image_paths,
+        pattern_size=pattern_size,
+        square_size_mm=square_size_mm,
+        focal_length_mm=focal_length_mm,
+        squeeze_ratio=squeeze_ratio,
+        desqueezed=desqueezed,
+    )
+    return point, [item.used for item in diagnostics.image_results]
 
 
 def calibrate_from_charuco_images(

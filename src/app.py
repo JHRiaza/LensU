@@ -17,6 +17,7 @@ import streamlit.components.v1 as components
 from board_generator import generate_charuco_pdf, generate_checkerboard_pdf
 from batch import BatchFolderResult, batch_calibrate_detailed
 from calibration import (
+    AnamorphicInfo,
     BreathingPoint,
     CalibrationDiagnostics,
     CalibrationPoint,
@@ -24,6 +25,7 @@ from calibration import (
     NodalOffset,
     accuracy_grade,
     aruco_available,
+    calibrate_anamorphic_detailed,
     calibrate_from_charuco_images,
     calibrate_from_images,
     compute_coverage_heatmap,
@@ -44,11 +46,12 @@ from lens_library import (
     search_library,
 )
 from live_calibration import live_calibration_ui
+from report import generate_calibration_report, generate_comparison_report
 from ue_export import export_ue_json, export_ue_python_script
 from video_extractor import extract_frames_from_video, extract_frames_with_checkerboard
 
 
-APP_VERSION = "v1.0"
+APP_VERSION = "v1.3"
 PROFILE_STATE_PATH = Path.home() / ".lensu" / "current_profile.json"
 
 st.set_page_config(page_title="LensU", page_icon="L", layout="wide")
@@ -91,6 +94,10 @@ if "batch_results" not in st.session_state:
     st.session_state.batch_results = []
 if "library_export_bundle" not in st.session_state:
     st.session_state.library_export_bundle = None
+if "report_download" not in st.session_state:
+    st.session_state.report_download = None
+if "comparison_report_download" not in st.session_state:
+    st.session_state.comparison_report_download = None
 
 
 def _run_key(focal_length_mm: float) -> str:
@@ -126,6 +133,106 @@ def _detect_preview(
     return found, display
 
 
+def _anamorphic_payload(point: CalibrationPoint) -> dict[str, float]:
+    return {
+        "k1": point.k1,
+        "k2": point.k2,
+        "p1": point.p1,
+        "p2": point.p2,
+        "k3": point.k3,
+        "cx": point.cx,
+        "cy": point.cy,
+        "fx": point.fx,
+        "fy": point.fy,
+        "rms_error": point.rms_error,
+    }
+
+
+def _scale_image_bytes_horizontally(file_bytes: bytes, scale: float) -> bytes:
+    array = np.frombuffer(file_bytes, dtype=np.uint8)
+    image = cv2.imdecode(array, cv2.IMREAD_COLOR)
+    if image is None:
+        return file_bytes
+    resized = cv2.resize(
+        image,
+        (max(1, int(round(image.shape[1] * scale))), image.shape[0]),
+        interpolation=cv2.INTER_CUBIC if scale >= 1.0 else cv2.INTER_AREA,
+    )
+    success, encoded = cv2.imencode(".png", resized)
+    if not success:
+        return file_bytes
+    return encoded.tobytes()
+
+
+def _calibrate_charuco_anamorphic(
+    image_paths: list[Path],
+    board_size: tuple[int, int],
+    square_length_mm: float,
+    marker_length_mm: float,
+    dictionary: int,
+    focal_length_mm: float,
+    squeeze_ratio: float,
+    desqueezed: bool,
+) -> tuple[CalibrationPoint | None, CalibrationDiagnostics]:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_dir = Path(tmpdir)
+        if desqueezed:
+            desqueezed_paths = image_paths
+            squeezed_paths = []
+            for index, path in enumerate(image_paths):
+                image = cv2.imread(str(path))
+                if image is None:
+                    continue
+                squeezed = cv2.resize(
+                    image,
+                    (max(1, int(round(image.shape[1] / squeeze_ratio))), image.shape[0]),
+                    interpolation=cv2.INTER_AREA,
+                )
+                target = temp_dir / f"squeezed_{index:03d}.png"
+                cv2.imwrite(str(target), squeezed)
+                squeezed_paths.append(target)
+        else:
+            squeezed_paths = image_paths
+            desqueezed_paths = []
+            for index, path in enumerate(image_paths):
+                image = cv2.imread(str(path))
+                if image is None:
+                    continue
+                desqueezed_image = cv2.resize(
+                    image,
+                    (max(1, int(round(image.shape[1] * squeeze_ratio))), image.shape[0]),
+                    interpolation=cv2.INTER_CUBIC,
+                )
+                target = temp_dir / f"desqueezed_{index:03d}.png"
+                cv2.imwrite(str(target), desqueezed_image)
+                desqueezed_paths.append(target)
+
+        desqueezed_point, desqueezed_diagnostics = calibrate_from_charuco_images(
+            desqueezed_paths,
+            board_size=board_size,
+            square_length_mm=square_length_mm,
+            marker_length_mm=marker_length_mm,
+            dictionary=dictionary,
+            focal_length_mm=focal_length_mm,
+        )
+        squeezed_point, _ = calibrate_from_charuco_images(
+            squeezed_paths,
+            board_size=board_size,
+            square_length_mm=square_length_mm,
+            marker_length_mm=marker_length_mm,
+            dictionary=dictionary,
+            focal_length_mm=focal_length_mm,
+        )
+
+    if desqueezed_point is None or squeezed_point is None:
+        return None, desqueezed_diagnostics
+
+    desqueezed_point.anamorphic_desqueezed = _anamorphic_payload(desqueezed_point)
+    desqueezed_point.anamorphic_squeezed = _anamorphic_payload(squeezed_point)
+    desqueezed_point.detection_mode = f"{desqueezed_point.detection_mode} (Anamorphic {squeeze_ratio:.2f}x)"
+    return desqueezed_point, desqueezed_diagnostics
+
+
 def _calibrate_files(
     uploaded_files: list[Any],
     focal_length: float,
@@ -136,6 +243,9 @@ def _calibrate_files(
     charuco_square_mm: float,
     charuco_marker_mm: float,
     charuco_dictionary: int,
+    anamorphic_enabled: bool = False,
+    squeeze_ratio: float = 2.0,
+    anamorphic_desqueezed: bool = False,
     excluded_names: set[str] | None = None,
 ) -> tuple[CalibrationPoint | None, CalibrationDiagnostics, list[dict[str, Any]]]:
     excluded_names = excluded_names or set()
@@ -152,7 +262,27 @@ def _calibrate_files(
             image_paths.append(path)
             file_payloads.append({"name": uploaded.name, "bytes": file_bytes, "excluded": False})
 
-        if mode == "ChArUco":
+        if anamorphic_enabled and mode == "ChArUco":
+            point, diagnostics = _calibrate_charuco_anamorphic(
+                image_paths=image_paths,
+                board_size=charuco_board_size,
+                square_length_mm=charuco_square_mm,
+                marker_length_mm=charuco_marker_mm,
+                dictionary=charuco_dictionary,
+                focal_length_mm=focal_length,
+                squeeze_ratio=squeeze_ratio,
+                desqueezed=anamorphic_desqueezed,
+            )
+        elif anamorphic_enabled:
+            point, diagnostics, _ = calibrate_anamorphic_detailed(
+                image_paths,
+                pattern_size=checkerboard_pattern,
+                square_size_mm=checker_square_mm,
+                focal_length_mm=focal_length,
+                squeeze_ratio=squeeze_ratio,
+                desqueezed=anamorphic_desqueezed,
+            )
+        elif mode == "ChArUco":
             point, diagnostics = calibrate_from_charuco_images(
                 image_paths,
                 board_size=charuco_board_size,
@@ -276,7 +406,7 @@ def _render_header() -> None:
 
 def _render_footer() -> None:
     st.divider()
-    st.caption("LensU v1.0 — Free lens calibration for virtual production")
+    st.caption("LensU v1.3 - Free lens calibration for virtual production")
 
 
 def _render_board_generator_sidebar(dictionary_names: dict[str, int]) -> None:
@@ -421,6 +551,34 @@ def _render_calibration_visuals(run: dict[str, Any]) -> None:
     stats[2].metric("Used Images", str(point.num_images))
     stats[3].metric("Detection Mode", point.detection_mode)
 
+    if point.anamorphic_desqueezed and point.anamorphic_squeezed:
+        st.subheader("Anamorphic Parameters")
+        st.dataframe(
+            [
+                {
+                    "space": "Desqueezed",
+                    "k1": round(point.anamorphic_desqueezed["k1"], 6),
+                    "k2": round(point.anamorphic_desqueezed["k2"], 6),
+                    "p1": round(point.anamorphic_desqueezed["p1"], 6),
+                    "p2": round(point.anamorphic_desqueezed["p2"], 6),
+                    "k3": round(point.anamorphic_desqueezed["k3"], 6),
+                    "cx": round(point.anamorphic_desqueezed["cx"], 4),
+                    "cy": round(point.anamorphic_desqueezed["cy"], 4),
+                },
+                {
+                    "space": "Squeezed",
+                    "k1": round(point.anamorphic_squeezed["k1"], 6),
+                    "k2": round(point.anamorphic_squeezed["k2"], 6),
+                    "p1": round(point.anamorphic_squeezed["p1"], 6),
+                    "p2": round(point.anamorphic_squeezed["p2"], 6),
+                    "k3": round(point.anamorphic_squeezed["k3"], 6),
+                    "cx": round(point.anamorphic_squeezed["cx"], 4),
+                    "cy": round(point.anamorphic_squeezed["cy"], 4),
+                },
+            ],
+            use_container_width=True,
+        )
+
     bar_values = [
         {"image_name": item.image_name, "error_px": item.reprojection_error}
         for item in diagnostics.image_results
@@ -454,6 +612,9 @@ def _render_calibration_visuals(run: dict[str, Any]) -> None:
                     charuco_square_mm=settings["charuco_square_mm"],
                     charuco_marker_mm=settings["charuco_marker_mm"],
                     charuco_dictionary=settings["charuco_dictionary"],
+                    anamorphic_enabled=settings["anamorphic_enabled"],
+                    squeeze_ratio=settings["squeeze_ratio"],
+                    anamorphic_desqueezed=settings["anamorphic_desqueezed"],
                 )
                 if point_new is None:
                     st.error("Re-calibration failed with the remaining images.")
@@ -782,6 +943,39 @@ def main() -> None:
             suggested_points = _suggest_zoom_points(float(zoom_min), float(zoom_max))
             st.caption("Suggested calibration points: " + ", ".join(f"{value:.1f}" for value in suggested_points))
 
+        st.subheader("Anamorphic")
+        anamorphic_enabled = st.toggle(
+            "Enable Anamorphic Lens Mode",
+            value=profile.anamorphic is not None,
+            help="Use separate squeezed and desqueezed calibration views for anamorphic glass.",
+        )
+        squeeze_ratio = 2.0
+        anamorphic_desqueezed = False
+        if anamorphic_enabled:
+            ratio_choice = st.selectbox("Squeeze Ratio", ["2.0x", "1.5x", "1.33x", "Custom"], index=0)
+            if ratio_choice == "Custom":
+                squeeze_ratio = st.number_input(
+                    "Custom Squeeze Ratio",
+                    value=profile.anamorphic.squeeze_ratio if profile.anamorphic is not None else 2.0,
+                    min_value=1.01,
+                    max_value=4.0,
+                    step=0.01,
+                    format="%.2f",
+                )
+            else:
+                squeeze_ratio = float(ratio_choice.replace("x", ""))
+            anamorphic_desqueezed = st.checkbox(
+                "Images are desqueezed",
+                value=profile.anamorphic.desqueeze_applied if profile.anamorphic is not None else False,
+                help="Enable this when the source images were already horizontally expanded before import.",
+            )
+            profile.anamorphic = AnamorphicInfo(
+                squeeze_ratio=float(squeeze_ratio),
+                desqueeze_applied=bool(anamorphic_desqueezed),
+            )
+        else:
+            profile.anamorphic = None
+
         _render_board_generator_sidebar(dictionary_names)
 
     settings = {
@@ -791,6 +985,9 @@ def main() -> None:
         "charuco_square_mm": float(charuco_square_mm),
         "charuco_marker_mm": float(charuco_marker_mm),
         "charuco_dictionary": int(dictionary_names[charuco_dictionary_name]),
+        "anamorphic_enabled": anamorphic_enabled,
+        "squeeze_ratio": float(squeeze_ratio),
+        "anamorphic_desqueezed": bool(anamorphic_desqueezed),
     }
 
     tab_calibrate, tab_live, tab_video, tab_batch, tab_breathing, tab_nodal, tab_profile, tab_library, tab_export = st.tabs(
@@ -853,6 +1050,9 @@ def main() -> None:
                     charuco_square_mm=settings["charuco_square_mm"],
                     charuco_marker_mm=settings["charuco_marker_mm"],
                     charuco_dictionary=settings["charuco_dictionary"],
+                    anamorphic_enabled=settings["anamorphic_enabled"],
+                    squeeze_ratio=settings["squeeze_ratio"],
+                    anamorphic_desqueezed=settings["anamorphic_desqueezed"],
                 )
             if point is None:
                 used_images = sum(1 for item in diagnostics.image_results if item.used)
@@ -1029,6 +1229,9 @@ def main() -> None:
                         charuco_square_mm=settings["charuco_square_mm"],
                         charuco_marker_mm=settings["charuco_marker_mm"],
                         charuco_dictionary=settings["charuco_dictionary"],
+                        anamorphic_enabled=settings["anamorphic_enabled"],
+                        squeeze_ratio=settings["squeeze_ratio"],
+                        anamorphic_desqueezed=settings["anamorphic_desqueezed"],
                     )
                 if point is None:
                     used_images = sum(1 for item in diagnostics.image_results if item.used)
@@ -1052,6 +1255,8 @@ def main() -> None:
         st.info(
             "Calibrate multiple focal lengths from subfolders such as 24mm, 35mm, and 50mm inside one base directory."
         )
+        if settings["anamorphic_enabled"] and detection_mode == "ChArUco":
+            st.warning("Batch anamorphic calibration currently uses checkerboard mode only. Switch board type to Checkerboard for anamorphic batch runs.")
         batch_base_dir = st.text_input(
             "Batch Folder Path",
             value="",
@@ -1099,7 +1304,15 @@ def main() -> None:
                         sensor_width_mm=profile.sensor_width_mm,
                         sensor_height_mm=profile.sensor_height_mm,
                         progress_callback=_progress,
+                        anamorphic_enabled=settings["anamorphic_enabled"] and detection_mode.lower() != "charuco",
+                        squeeze_ratio=settings["squeeze_ratio"],
+                        anamorphic_desqueezed=settings["anamorphic_desqueezed"],
                     )
+                    if settings["anamorphic_enabled"]:
+                        profile.anamorphic = AnamorphicInfo(
+                            squeeze_ratio=settings["squeeze_ratio"],
+                            desqueeze_applied=settings["anamorphic_desqueezed"],
+                        )
                     st.session_state.batch_results = results
                     for batch_point in batch_profile.calibration_points:
                         profile.add_calibration(batch_point)
@@ -1154,6 +1367,9 @@ def main() -> None:
                     charuco_square_mm=settings["charuco_square_mm"],
                     charuco_marker_mm=settings["charuco_marker_mm"],
                     charuco_dictionary=settings["charuco_dictionary"],
+                    anamorphic_enabled=settings["anamorphic_enabled"],
+                    squeeze_ratio=settings["squeeze_ratio"],
+                    anamorphic_desqueezed=settings["anamorphic_desqueezed"],
                 )
             if point is None:
                 st.error("Breathing measurement failed. Capture more diverse, sharper board views.")
@@ -1331,6 +1547,11 @@ def main() -> None:
 
     with tab_profile:
         st.header("Lens Profile")
+        if profile.anamorphic is not None:
+            st.info(
+                f"Anamorphic profile: {profile.anamorphic.squeeze_ratio:.2f}x | "
+                f"{'desqueezed input' if profile.anamorphic.desqueeze_applied else 'raw squeezed input'}"
+            )
         if not profile.calibration_points and not profile.nodal_offsets and not profile.breathing_profiles:
             st.warning("No calibration data recorded yet.")
         else:
@@ -1360,6 +1581,28 @@ def main() -> None:
                         st.caption(
                             f"Focal length in pixels: fx={point.fx:.2f}, fy={point.fy:.2f}. Images used: {point.num_images}."
                         )
+                        if point.anamorphic_desqueezed and point.anamorphic_squeezed:
+                            st.dataframe(
+                                [
+                                    {
+                                        "space": "Desqueezed",
+                                        "k1": round(point.anamorphic_desqueezed["k1"], 6),
+                                        "k2": round(point.anamorphic_desqueezed["k2"], 6),
+                                        "p1": round(point.anamorphic_desqueezed["p1"], 6),
+                                        "p2": round(point.anamorphic_desqueezed["p2"], 6),
+                                        "k3": round(point.anamorphic_desqueezed["k3"], 6),
+                                    },
+                                    {
+                                        "space": "Squeezed",
+                                        "k1": round(point.anamorphic_squeezed["k1"], 6),
+                                        "k2": round(point.anamorphic_squeezed["k2"], 6),
+                                        "p1": round(point.anamorphic_squeezed["p1"], 6),
+                                        "p2": round(point.anamorphic_squeezed["p2"], 6),
+                                        "k3": round(point.anamorphic_squeezed["k3"], 6),
+                                    },
+                                ],
+                                use_container_width=True,
+                            )
 
             if len(profile.calibration_points) >= 2:
                 st.subheader("Zoom Interpolation")
@@ -1426,6 +1669,25 @@ def main() -> None:
                 other_profile = _load_profile_from_upload(uploaded_compare.getvalue().decode("utf-8"))
                 comparison_rows = _compare_profiles(profile, other_profile)
                 st.dataframe(comparison_rows, use_container_width=True)
+                if st.button("Generate Comparison Report", key="generate_comparison_report"):
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        report_path = generate_comparison_report(
+                            profile,
+                            other_profile,
+                            Path(tmpdir) / f"{profile.lens_name.replace(' ', '_')}_comparison_report.pdf",
+                        )
+                        st.session_state.comparison_report_download = {
+                            "name": report_path.name,
+                            "bytes": report_path.read_bytes(),
+                        }
+            comparison_report = st.session_state.comparison_report_download
+            if comparison_report:
+                st.download_button(
+                    "Download Comparison Report (PDF)",
+                    data=comparison_report["bytes"],
+                    file_name=comparison_report["name"],
+                    mime="application/pdf",
+                )
 
             st.divider()
             profile_json = profile.to_dict()
@@ -1539,6 +1801,17 @@ def main() -> None:
 
             if st.button("Generate UE Export Package", type="primary"):
                 st.session_state.export_bundle = _prepare_export_bundle(profile, data_mode, include_stmaps)
+            if st.button("Generate Report"):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    report_path = generate_calibration_report(
+                        profile,
+                        Path(tmpdir) / f"{profile.lens_name.replace(' ', '_')}_calibration_report.pdf",
+                        include_charts=True,
+                    )
+                    st.session_state.report_download = {
+                        "name": report_path.name,
+                        "bytes": report_path.read_bytes(),
+                    }
 
             bundle = st.session_state.export_bundle
             if bundle:
@@ -1556,6 +1829,14 @@ def main() -> None:
                 with st.expander("UE Python Script"):
                     st.code(bundle["script_text"], language="python")
                     _copy_text_button("Copy to clipboard", bundle["script_text"], key="copy_ue_script")
+            report_bundle = st.session_state.report_download
+            if report_bundle:
+                st.download_button(
+                    "Download Calibration Report (PDF)",
+                    data=report_bundle["bytes"],
+                    file_name=report_bundle["name"],
+                    mime="application/pdf",
+                )
 
             st.divider()
             st.markdown(

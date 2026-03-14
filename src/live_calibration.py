@@ -11,7 +11,15 @@ import cv2
 import numpy as np
 import streamlit as st
 
-from calibration import CalibrationDiagnostics, CalibrationPoint, accuracy_grade, calibrate_from_charuco_images, calibrate_from_images, compute_coverage_heatmap
+from calibration import (
+    CalibrationDiagnostics,
+    CalibrationPoint,
+    accuracy_grade,
+    calibrate_anamorphic_detailed,
+    calibrate_from_charuco_images,
+    calibrate_from_images,
+    compute_coverage_heatmap,
+)
 
 
 def _state() -> dict[str, Any]:
@@ -93,6 +101,94 @@ def _calibrate_captures(
             path = Path(tmpdir) / f"live_{index:03d}.png"
             path.write_bytes(capture["bytes"])
             paths.append(path)
+        if settings.get("anamorphic_enabled") and mode != "ChArUco":
+            point, diagnostics, _ = calibrate_anamorphic_detailed(
+                paths,
+                pattern_size=settings["checkerboard_pattern"],
+                square_size_mm=settings["checker_square_mm"],
+                focal_length_mm=focal_length_mm,
+                squeeze_ratio=settings["squeeze_ratio"],
+                desqueezed=settings["anamorphic_desqueezed"],
+            )
+            return point, diagnostics
+        if settings.get("anamorphic_enabled") and mode == "ChArUco":
+            desqueezed = bool(settings["anamorphic_desqueezed"])
+            squeeze_ratio = float(settings["squeeze_ratio"])
+            with tempfile.TemporaryDirectory() as tmpdir_charuco:
+                temp_dir = Path(tmpdir_charuco)
+                if desqueezed:
+                    desqueezed_paths = paths
+                    squeezed_paths: list[Path] = []
+                    for index, path in enumerate(paths):
+                        image = cv2.imread(str(path))
+                        if image is None:
+                            continue
+                        squeezed = cv2.resize(
+                            image,
+                            (max(1, int(round(image.shape[1] / squeeze_ratio))), image.shape[0]),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                        target = temp_dir / f"squeezed_{index:03d}.png"
+                        cv2.imwrite(str(target), squeezed)
+                        squeezed_paths.append(target)
+                else:
+                    squeezed_paths = paths
+                    desqueezed_paths = []
+                    for index, path in enumerate(paths):
+                        image = cv2.imread(str(path))
+                        if image is None:
+                            continue
+                        desqueezed_image = cv2.resize(
+                            image,
+                            (max(1, int(round(image.shape[1] * squeeze_ratio))), image.shape[0]),
+                            interpolation=cv2.INTER_CUBIC,
+                        )
+                        target = temp_dir / f"desqueezed_{index:03d}.png"
+                        cv2.imwrite(str(target), desqueezed_image)
+                        desqueezed_paths.append(target)
+                point, diagnostics = calibrate_from_charuco_images(
+                    desqueezed_paths,
+                    board_size=settings["charuco_board_size"],
+                    square_length_mm=settings["charuco_square_mm"],
+                    marker_length_mm=settings["charuco_marker_mm"],
+                    dictionary=settings["charuco_dictionary"],
+                    focal_length_mm=focal_length_mm,
+                )
+                squeezed_point, _ = calibrate_from_charuco_images(
+                    squeezed_paths,
+                    board_size=settings["charuco_board_size"],
+                    square_length_mm=settings["charuco_square_mm"],
+                    marker_length_mm=settings["charuco_marker_mm"],
+                    dictionary=settings["charuco_dictionary"],
+                    focal_length_mm=focal_length_mm,
+                )
+                if point is not None and squeezed_point is not None:
+                    point.anamorphic_desqueezed = {
+                        "k1": point.k1,
+                        "k2": point.k2,
+                        "p1": point.p1,
+                        "p2": point.p2,
+                        "k3": point.k3,
+                        "cx": point.cx,
+                        "cy": point.cy,
+                        "fx": point.fx,
+                        "fy": point.fy,
+                        "rms_error": point.rms_error,
+                    }
+                    point.anamorphic_squeezed = {
+                        "k1": squeezed_point.k1,
+                        "k2": squeezed_point.k2,
+                        "p1": squeezed_point.p1,
+                        "p2": squeezed_point.p2,
+                        "k3": squeezed_point.k3,
+                        "cx": squeezed_point.cx,
+                        "cy": squeezed_point.cy,
+                        "fx": squeezed_point.fx,
+                        "fy": squeezed_point.fy,
+                        "rms_error": squeezed_point.rms_error,
+                    }
+                    point.detection_mode = f"{point.detection_mode} (Anamorphic {squeeze_ratio:.2f}x)"
+                return point, diagnostics
         if mode == "ChArUco":
             return calibrate_from_charuco_images(
                 paths,

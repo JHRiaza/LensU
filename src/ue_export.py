@@ -40,11 +40,28 @@ def export_ue_json(
             "sensor_height_mm": profile.sensor_height_mm,
             "image_width": profile.image_width,
             "image_height": profile.image_height,
+            "anamorphic": (
+                {
+                    "squeeze_ratio": profile.anamorphic.squeeze_ratio,
+                    "desqueeze_applied": profile.anamorphic.desqueeze_applied,
+                }
+                if profile.anamorphic is not None
+                else None
+            ),
         },
         "user_metadata": {
             "generator": "LensU",
             "version": LENSU_VERSION,
             "breathing_ratio_by_focal_length": breathing_summary,
+            "anamorphic": (
+                {
+                    "squeeze_ratio": profile.anamorphic.squeeze_ratio,
+                    "desqueeze_applied": profile.anamorphic.desqueeze_applied,
+                    "calibration_space": "desqueezed",
+                }
+                if profile.anamorphic is not None
+                else None
+            ),
         },
         "distortion_table": [],
         "focal_length_table": [],
