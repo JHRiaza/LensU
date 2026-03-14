@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 
 
-LENSU_VERSION = "Sprint1"
+LENSU_VERSION = "v1.0"
 
 
 @dataclass
@@ -76,11 +76,11 @@ class LensProfile:
         return asdict(self)
 
     def save_json(self, path: Path) -> None:
-        path.write_text(json.dumps(self.to_dict(), indent=2))
+        path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
 
     @classmethod
     def load_json(cls, path: Path) -> "LensProfile":
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
         profile = cls(
             lens_name=data.get("lens_name", "Unknown"),
             sensor_width_mm=data.get("sensor_width_mm", 36.0),

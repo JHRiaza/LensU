@@ -22,6 +22,7 @@ def export_ue_json(
     output_path: Path,
     data_mode: DataMode = "Parameters",
     stmap_directory: Optional[Path] = None,
+    include_stmaps: bool = False,
 ) -> Path:
     """Export lens profile as UE-oriented JSON."""
 
@@ -72,13 +73,14 @@ def export_ue_json(
             }
         )
 
-        if data_mode == "STMap":
+        if data_mode == "STMap" or include_stmaps:
             stmap_name = f"{_safe_name(profile.lens_name)}_{zoom:.1f}mm_stmap.exr"
             stmap_path = generate_stmap_from_calibration(
                 point,
                 (profile.image_width, profile.image_height),
                 stmap_directory / stmap_name,
             )
+        if data_mode == "STMap":
             ue_data["st_map_table"].append(
                 {
                     "focus": focus,

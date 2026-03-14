@@ -12,7 +12,9 @@ from typing import Any
 import cv2
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 
+from board_generator import generate_charuco_pdf, generate_checkerboard_pdf
 from calibration import (
     CalibrationDiagnostics,
     CalibrationPoint,
@@ -30,15 +32,48 @@ from calibration import (
     undistort_image,
 )
 from ue_export import export_ue_json, export_ue_python_script
+from video_extractor import extract_frames_from_video, extract_frames_with_checkerboard
 
 
-st.set_page_config(page_title="LensU", page_icon="📷", layout="wide")
+APP_VERSION = "v1.0"
+PROFILE_STATE_PATH = Path.home() / ".lensu" / "current_profile.json"
+
+st.set_page_config(page_title="LensU", page_icon="L", layout="wide")
+
+
+class MemoryUpload:
+    def __init__(self, name: str, data: bytes):
+        self.name = name
+        self._data = data
+
+    def getvalue(self) -> bytes:
+        return self._data
+
+
+def _load_persisted_profile() -> LensProfile:
+    try:
+        if PROFILE_STATE_PATH.exists():
+            return LensProfile.load_json(PROFILE_STATE_PATH)
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        pass
+    return LensProfile()
+
+
+def _save_profile(profile: LensProfile) -> None:
+    PROFILE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    profile.save_json(PROFILE_STATE_PATH)
 
 
 if "profile" not in st.session_state:
-    st.session_state.profile = LensProfile()
+    st.session_state.profile = _load_persisted_profile()
 if "calibration_runs" not in st.session_state:
     st.session_state.calibration_runs = {}
+if "extracted_frames" not in st.session_state:
+    st.session_state.extracted_frames = []
+if "board_download" not in st.session_state:
+    st.session_state.board_download = None
+if "export_bundle" not in st.session_state:
+    st.session_state.export_bundle = None
 
 
 def _run_key(focal_length_mm: float) -> str:
@@ -137,7 +172,9 @@ def _store_run(
     }
 
 
-def _render_vega_bar_chart(values: list[dict[str, Any]], x_field: str, y_field: str, title: str) -> None:
+def _render_vega_bar_chart(
+    values: list[dict[str, Any]], x_field: str, y_field: str, title: str
+) -> None:
     if not values:
         return
     st.vega_lite_chart(
@@ -161,7 +198,11 @@ def _render_vega_line_chart(values: list[dict[str, Any]], title: str) -> None:
             "data": {"values": values},
             "mark": {"type": "line", "point": True},
             "encoding": {
-                "x": {"field": "focal_length_mm", "type": "quantitative", "title": "Focal Length (mm)"},
+                "x": {
+                    "field": "focal_length_mm",
+                    "type": "quantitative",
+                    "title": "Focal Length (mm)",
+                },
                 "y": {"field": "value", "type": "quantitative", "title": title},
                 "color": {"field": "parameter", "type": "nominal", "title": ""},
             },
@@ -194,6 +235,133 @@ def _load_profile_from_upload(payload: bytes) -> LensProfile:
     for offset in data.get("nodal_offsets", []):
         loaded.nodal_offsets.append(NodalOffset(**offset))
     return loaded
+
+
+def _copy_text_button(label: str, text: str, key: str) -> None:
+    if st.button(label, key=key):
+        components.html(
+            f"<script>navigator.clipboard.writeText({json.dumps(text)});</script>",
+            height=0,
+        )
+        st.success("Copied to clipboard.")
+
+
+def _format_zip_size(num_bytes: int) -> str:
+    units = ["B", "KB", "MB", "GB"]
+    size = float(num_bytes)
+    for unit in units:
+        if size < 1024.0 or unit == units[-1]:
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{num_bytes} B"
+
+
+def _render_header() -> None:
+    st.markdown(
+        f"""
+        <div style="padding: 0.4rem 0 1rem 0;">
+            <div style="font-size: 2rem; font-weight: 700; letter-spacing: 0.02em;">LensU</div>
+            <div style="color: #6b7280;">{APP_VERSION} | Free lens calibration for virtual production</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_footer() -> None:
+    st.divider()
+    st.caption("LensU v1.0 — Free lens calibration for virtual production")
+
+
+def _render_board_generator_sidebar(dictionary_names: dict[str, int]) -> None:
+    st.divider()
+    st.header("Print Calibration Board")
+    board_type = st.radio(
+        "Board PDF Type",
+        ["Checkerboard", "ChArUco"],
+        horizontal=True,
+        disabled=not aruco_available(),
+        help="Create a printable PDF board at a fixed real-world size for stage or studio calibration.",
+    )
+    if board_type == "Checkerboard":
+        b1, b2 = st.columns(2)
+        with b1:
+            board_cols = st.number_input("Cols", value=9, min_value=3, max_value=20, key="board_cb_cols")
+        with b2:
+            board_rows = st.number_input("Rows", value=6, min_value=3, max_value=20, key="board_cb_rows")
+        board_square_mm = st.number_input(
+            "Square Size (mm)",
+            value=25.0,
+            step=1.0,
+            format="%.1f",
+            key="board_cb_square",
+            help="Physical square size on paper. This must match the size used during calibration.",
+        )
+    else:
+        b1, b2 = st.columns(2)
+        with b1:
+            board_cols = st.number_input("Cols", value=7, min_value=3, max_value=20, key="board_ch_cols")
+        with b2:
+            board_rows = st.number_input("Rows", value=5, min_value=3, max_value=20, key="board_ch_rows")
+        board_square_mm = st.number_input(
+            "Square Length (mm)",
+            value=30.0,
+            step=1.0,
+            format="%.1f",
+            key="board_ch_square",
+            help="Physical ChArUco chessboard square size on the printed page.",
+        )
+        marker_mm = st.number_input(
+            "Marker Length (mm)",
+            value=22.5,
+            step=0.5,
+            format="%.1f",
+            key="board_ch_marker",
+            help="Black ArUco marker size inside each square. This must stay smaller than the square length.",
+        )
+        dictionary_name = st.selectbox("Dictionary", list(dictionary_names.keys()), key="board_dict")
+
+    page_size = st.selectbox("Page Size", ["A4", "A3", "A2", "A1"], index=1)
+    include_metadata = st.toggle("Include Metadata", value=True)
+
+    if st.button("Generate Board PDF", use_container_width=True):
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                output_path = Path(tmpdir) / f"{board_type.lower()}_{page_size.lower()}.pdf"
+                if board_type == "Checkerboard":
+                    generate_checkerboard_pdf(
+                        pattern_size=(int(board_cols), int(board_rows)),
+                        square_size_mm=float(board_square_mm),
+                        page_size=page_size,
+                        output_path=output_path,
+                        include_metadata=include_metadata,
+                    )
+                else:
+                    generate_charuco_pdf(
+                        board_size=(int(board_cols), int(board_rows)),
+                        square_length_mm=float(board_square_mm),
+                        marker_length_mm=float(marker_mm),
+                        dictionary=int(dictionary_names[dictionary_name]),
+                        page_size=page_size,
+                        output_path=output_path,
+                        include_metadata=include_metadata,
+                    )
+                st.session_state.board_download = {
+                    "name": output_path.name,
+                    "bytes": output_path.read_bytes(),
+                }
+        except Exception as exc:
+            st.error(f"Board generation failed: {exc}")
+
+    board_download = st.session_state.board_download
+    if board_download:
+        st.download_button(
+            "Download Board PDF",
+            data=board_download["bytes"],
+            file_name=board_download["name"],
+            mime="application/pdf",
+            use_container_width=True,
+        )
 
 
 def _render_calibration_visuals(run: dict[str, Any]) -> None:
@@ -238,7 +406,11 @@ def _render_calibration_visuals(run: dict[str, Any]) -> None:
 
     st.subheader("Accuracy Reporting")
     stats = st.columns(4)
-    stats[0].metric("RMS Error", f"{point.rms_error:.4f} px")
+    stats[0].metric(
+        "RMS Error",
+        f"{point.rms_error:.4f} px",
+        help="Root-mean-square reprojection error. Lower means the fitted lens model matches detections more closely.",
+    )
     stats[1].metric("Grade", accuracy_grade(point.rms_error))
     stats[2].metric("Used Images", str(point.num_images))
     stats[3].metric("Detection Mode", point.detection_mode)
@@ -254,26 +426,18 @@ def _render_calibration_visuals(run: dict[str, Any]) -> None:
     outliers = diagnostics.outlier_names
     if outliers:
         st.warning("Outliers flagged (>2x mean reprojection error): " + ", ".join(outliers))
-        default_selection = outliers
         selected = st.multiselect(
             "Exclude images and re-calibrate",
             [entry["name"] for entry in files],
-            default=default_selection,
+            default=outliers,
             key=f"exclude_{_run_key(point.focal_length_mm)}",
+            help="Drop bad detections or motion-blurred frames and rerun calibration with the remaining set.",
         )
         if st.button("Re-calibrate Without Selected Images", key=f"recal_{_run_key(point.focal_length_mm)}"):
             remaining = [entry for entry in files if entry["name"] not in set(selected)]
             if len(remaining) < 3:
                 st.error("Need at least 3 valid images after exclusion.")
             else:
-                class MemoryUpload:
-                    def __init__(self, name: str, data: bytes):
-                        self.name = name
-                        self._data = data
-
-                    def getvalue(self) -> bytes:
-                        return self._data
-
                 point_new, diagnostics_new, files_new = _calibrate_files(
                     [MemoryUpload(entry["name"], entry["bytes"]) for entry in remaining],
                     focal_length=point.focal_length_mm,
@@ -292,6 +456,7 @@ def _render_calibration_visuals(run: dict[str, Any]) -> None:
                     st.session_state.profile.image_width = diagnostics_new.image_size[0]
                     st.session_state.profile.image_height = diagnostics_new.image_size[1]
                     _store_run(point_new.focal_length_mm, run["mode"], point_new, diagnostics_new, files_new, settings)
+                    _save_profile(st.session_state.profile)
                     st.rerun()
 
     st.subheader("Detection Results")
@@ -315,21 +480,105 @@ def _render_calibration_visuals(run: dict[str, Any]) -> None:
             st.caption("OK" if found else "FAILED")
 
 
+def _compare_profiles(current: LensProfile, other: LensProfile) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    current_points = {round(point.focal_length_mm, 3): point for point in current.calibration_points}
+    other_points = {round(point.focal_length_mm, 3): point for point in other.calibration_points}
+    for focal in sorted(set(current_points) | set(other_points)):
+        point_a = current_points.get(focal)
+        point_b = other_points.get(focal)
+        rows.append(
+            {
+                "type": "Calibration",
+                "focal_length_mm": focal,
+                "k1_diff": (point_b.k1 - point_a.k1) if point_a and point_b else None,
+                "k2_diff": (point_b.k2 - point_a.k2) if point_a and point_b else None,
+                "p1_diff": (point_b.p1 - point_a.p1) if point_a and point_b else None,
+                "p2_diff": (point_b.p2 - point_a.p2) if point_a and point_b else None,
+                "k3_diff": (point_b.k3 - point_a.k3) if point_a and point_b else None,
+            }
+        )
+
+    current_offsets = {round(offset.focal_length_mm, 3): offset for offset in current.nodal_offsets}
+    other_offsets = {round(offset.focal_length_mm, 3): offset for offset in other.nodal_offsets}
+    for focal in sorted(set(current_offsets) | set(other_offsets)):
+        offset_a = current_offsets.get(focal)
+        offset_b = other_offsets.get(focal)
+        rows.append(
+            {
+                "type": "Nodal",
+                "focal_length_mm": focal,
+                "offset_x_diff": (offset_b.offset_x - offset_a.offset_x) if offset_a and offset_b else None,
+                "offset_y_diff": (offset_b.offset_y - offset_a.offset_y) if offset_a and offset_b else None,
+                "offset_z_diff": (offset_b.offset_z - offset_a.offset_z) if offset_a and offset_b else None,
+                "rotation_x_diff": (offset_b.rotation_x - offset_a.rotation_x) if offset_a and offset_b else None,
+                "rotation_y_diff": (offset_b.rotation_y - offset_a.rotation_y) if offset_a and offset_b else None,
+                "rotation_z_diff": (offset_b.rotation_z - offset_a.rotation_z) if offset_a and offset_b else None,
+            }
+        )
+    return rows
+
+
+def _prepare_export_bundle(profile: LensProfile, data_mode: str, include_stmaps: bool) -> dict[str, Any]:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        stmap_dir = tmp_path / "stmaps"
+        json_path = export_ue_json(
+            profile,
+            tmp_path,
+            data_mode=data_mode,
+            stmap_directory=stmap_dir,
+            include_stmaps=include_stmaps,
+        )
+        script_path = export_ue_python_script(profile, json_path.name, tmp_path, data_mode=data_mode)
+
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.write(json_path, json_path.name)
+            archive.write(script_path, script_path.name)
+            if include_stmaps and stmap_dir.exists():
+                for stmap_file in sorted(stmap_dir.iterdir()):
+                    archive.write(stmap_file, f"stmaps/{stmap_file.name}")
+        zip_bytes = zip_buffer.getvalue()
+        return {
+            "name": f"LensU_{profile.lens_name.replace(' ', '_')}_{data_mode}.zip",
+            "bytes": zip_bytes,
+            "zip_size": len(zip_bytes),
+            "json_text": json_path.read_text(encoding="utf-8"),
+            "script_text": script_path.read_text(encoding="utf-8"),
+        }
+
+
 def main() -> None:
-    st.title("LensU")
-    st.caption("Cinema lens calibration and Unreal Engine LensFile export")
+    profile: LensProfile = st.session_state.profile
+    _render_header()
 
     with st.sidebar:
         st.header("Lens Setup")
-        profile: LensProfile = st.session_state.profile
-        profile.lens_name = st.text_input("Lens Name", value=profile.lens_name)
+        profile.lens_name = st.text_input(
+            "Lens Name",
+            value=profile.lens_name,
+            help="Profile name used in JSON and Unreal export file names.",
+        )
 
         st.subheader("Sensor")
         col1, col2 = st.columns(2)
         with col1:
-            profile.sensor_width_mm = st.number_input("Width (mm)", value=profile.sensor_width_mm, step=0.1, format="%.1f")
+            profile.sensor_width_mm = st.number_input(
+                "Width (mm)",
+                value=profile.sensor_width_mm,
+                step=0.1,
+                format="%.1f",
+                help="Physical sensor width. This affects focal normalization in the export data.",
+            )
         with col2:
-            profile.sensor_height_mm = st.number_input("Height (mm)", value=profile.sensor_height_mm, step=0.1, format="%.1f")
+            profile.sensor_height_mm = st.number_input(
+                "Height (mm)",
+                value=profile.sensor_height_mm,
+                step=0.1,
+                format="%.1f",
+                help="Physical sensor height. Match the camera gate or recording crop used for calibration.",
+            )
 
         sensor_presets = {
             "Full Frame (36x24)": (36.0, 24.0),
@@ -348,6 +597,7 @@ def main() -> None:
             ["Checkerboard", "ChArUco"],
             index=0,
             disabled=not aruco_available(),
+            help="Checkerboard is simplest. ChArUco is more robust when the board is partially occluded or near frame edges.",
         )
         if not aruco_available():
             st.caption("This OpenCV build does not expose `cv2.aruco`; ChArUco mode is unavailable.")
@@ -355,10 +605,28 @@ def main() -> None:
         st.subheader("Checkerboard")
         cb1, cb2 = st.columns(2)
         with cb1:
-            pattern_cols = st.number_input("Inner Corners (cols)", value=9, min_value=3, max_value=20)
+            pattern_cols = st.number_input(
+                "Inner Corners (cols)",
+                value=9,
+                min_value=3,
+                max_value=20,
+                help="Number of detectable inner checkerboard corners horizontally.",
+            )
         with cb2:
-            pattern_rows = st.number_input("Inner Corners (rows)", value=6, min_value=3, max_value=20)
-        checker_square_mm = st.number_input("Square Size (mm)", value=25.0, step=1.0, format="%.1f")
+            pattern_rows = st.number_input(
+                "Inner Corners (rows)",
+                value=6,
+                min_value=3,
+                max_value=20,
+                help="Number of detectable inner checkerboard corners vertically.",
+            )
+        checker_square_mm = st.number_input(
+            "Square Size (mm)",
+            value=25.0,
+            step=1.0,
+            format="%.1f",
+            help="Real checkerboard square size. This sets the calibration board scale.",
+        )
 
         st.subheader("ChArUco")
         ch1, ch2 = st.columns(2)
@@ -366,17 +634,37 @@ def main() -> None:
             charuco_cols = st.number_input("Squares (cols)", value=7, min_value=3, max_value=20)
         with ch2:
             charuco_rows = st.number_input("Squares (rows)", value=5, min_value=3, max_value=20)
-        charuco_square_mm = st.number_input("Square Length (mm)", value=30.0, step=1.0, format="%.1f")
-        charuco_marker_mm = st.number_input("Marker Length (mm)", value=22.5, step=0.5, format="%.1f")
+        charuco_square_mm = st.number_input(
+            "Square Length (mm)",
+            value=30.0,
+            step=1.0,
+            format="%.1f",
+            help="Outer square size for ChArUco calibration boards.",
+        )
+        charuco_marker_mm = st.number_input(
+            "Marker Length (mm)",
+            value=22.5,
+            step=0.5,
+            format="%.1f",
+            help="Inner ArUco marker size. Keep this slightly smaller than the square length.",
+        )
         dictionary_names = {
             "DICT_4X4_50": cv2.aruco.DICT_4X4_50 if aruco_available() else 0,
             "DICT_5X5_100": cv2.aruco.DICT_5X5_100 if aruco_available() else 0,
             "DICT_6X6_250": cv2.aruco.DICT_6X6_250 if aruco_available() else 0,
         }
-        charuco_dictionary_name = st.selectbox("Dictionary", list(dictionary_names.keys()), index=2 if aruco_available() else 0)
+        charuco_dictionary_name = st.selectbox(
+            "Dictionary",
+            list(dictionary_names.keys()),
+            index=2 if aruco_available() else 0,
+        )
 
         st.subheader("Zoom Lens Workflow")
-        zoom_mode = st.toggle("Zoom Lens Mode", value=False)
+        zoom_mode = st.toggle(
+            "Zoom Lens Mode",
+            value=False,
+            help="Track multiple focal lengths in one profile and use the suggested calibration anchors across the zoom range.",
+        )
         zoom_min = zoom_max = 0.0
         suggested_points: list[float] = []
         if zoom_mode:
@@ -388,8 +676,19 @@ def main() -> None:
             suggested_points = _suggest_zoom_points(float(zoom_min), float(zoom_max))
             st.caption("Suggested calibration points: " + ", ".join(f"{value:.1f}" for value in suggested_points))
 
-    tab_calibrate, tab_nodal, tab_profile, tab_export = st.tabs(
-        ["Distortion Calibration", "Nodal Offset", "Lens Profile", "UE Export"]
+        _render_board_generator_sidebar(dictionary_names)
+
+    settings = {
+        "checkerboard_pattern": (int(pattern_cols), int(pattern_rows)),
+        "checker_square_mm": float(checker_square_mm),
+        "charuco_board_size": (int(charuco_cols), int(charuco_rows)),
+        "charuco_square_mm": float(charuco_square_mm),
+        "charuco_marker_mm": float(charuco_marker_mm),
+        "charuco_dictionary": int(dictionary_names[charuco_dictionary_name]),
+    }
+
+    tab_calibrate, tab_video, tab_nodal, tab_profile, tab_export = st.tabs(
+        ["Distortion Calibration", "Video Calibration", "Nodal Offset", "Lens Profile", "UE Export"]
     )
 
     with tab_calibrate:
@@ -403,28 +702,28 @@ def main() -> None:
             st.caption(
                 "Workflow: "
                 + "  ".join(
-                    f"{value:.1f}mm [{'done' if round(value, 1) in completed else 'pending'}]" for value in suggested_points
+                    f"{value:.1f}mm [{'done' if round(value, 1) in completed else 'pending'}]"
+                    for value in suggested_points
                 )
             )
             focal_length = st.selectbox("Calibration Point", suggested_points, key="zoom_focal_select")
         else:
-            focal_length = st.number_input("Focal Length (mm)", value=50.0, step=1.0, format="%.1f", key="cal_focal")
+            focal_length = st.number_input(
+                "Focal Length (mm)",
+                value=50.0,
+                step=1.0,
+                format="%.1f",
+                key="cal_focal",
+                help="Actual focal length used for this image set. LensU stores one distortion fit per focal length.",
+            )
 
         uploaded_files = st.file_uploader(
             "Upload calibration images",
             type=["jpg", "jpeg", "png", "bmp", "tiff"],
             accept_multiple_files=True,
             key=f"cal_images_{_run_key(float(focal_length))}_{detection_mode}",
+            help="Use a spread of angles, distances, and frame coverage for a stable calibration.",
         )
-
-        settings = {
-            "checkerboard_pattern": (int(pattern_cols), int(pattern_rows)),
-            "checker_square_mm": float(checker_square_mm),
-            "charuco_board_size": (int(charuco_cols), int(charuco_rows)),
-            "charuco_square_mm": float(charuco_square_mm),
-            "charuco_marker_mm": float(charuco_marker_mm),
-            "charuco_dictionary": int(dictionary_names[charuco_dictionary_name]),
-        }
 
         if uploaded_files and st.button("Run Calibration", type="primary"):
             with st.spinner("Running calibration..."):
@@ -441,34 +740,243 @@ def main() -> None:
                 )
             if point is None:
                 used_images = sum(1 for item in diagnostics.image_results if item.used)
-                st.error(f"Calibration failed. Only {used_images}/{len(diagnostics.image_results)} images produced usable detections.")
+                st.error(
+                    f"Calibration failed. Only {used_images}/{len(diagnostics.image_results)} images produced usable detections."
+                )
             else:
                 profile.add_calibration(point)
                 if diagnostics.image_size:
                     profile.image_width, profile.image_height = diagnostics.image_size
                 _store_run(float(focal_length), detection_mode, point, diagnostics, files, settings)
-                st.success(f"Calibration complete. RMS: {point.rms_error:.4f}px, grade: {accuracy_grade(point.rms_error)}.")
+                _save_profile(profile)
+                st.success(
+                    f"Calibration complete. RMS: {point.rms_error:.4f}px, grade: {accuracy_grade(point.rms_error)}."
+                )
 
         current_run = st.session_state.calibration_runs.get(_run_key(float(focal_length)))
         if current_run:
             _render_calibration_visuals(current_run)
 
+    with tab_video:
+        st.header("Video Calibration")
+        st.info(
+            "Extract usable frames from a stage recording, review detection overlays, then calibrate directly from the extracted set."
+        )
+        video_focal_length = st.number_input(
+            "Video Focal Length (mm)",
+            value=50.0,
+            step=1.0,
+            format="%.1f",
+            key="video_focal",
+            help="Focal length represented by the uploaded video clip.",
+        )
+        video_file = st.file_uploader(
+            "Upload calibration video",
+            type=["mp4", "mov", "avi", "mkv", "mxf"],
+            key="video_upload",
+            help="Common H.264, H.265, ProRes, and similar formats should work if your local OpenCV build can decode them.",
+        )
+        extraction_mode = st.radio(
+            "Extraction Mode",
+            ["Regular interval", "Smart (checkerboard-aware)"],
+            horizontal=True,
+            help="Regular interval samples frames by time. Smart mode keeps only diverse checkerboard views.",
+        )
+        if extraction_mode == "Regular interval":
+            interval_seconds = st.number_input(
+                "Interval (seconds)",
+                value=1.0,
+                min_value=0.1,
+                step=0.1,
+                format="%.1f",
+                help="Extract one frame every N seconds from the recording.",
+            )
+            max_video_frames = st.slider("Max Frames", min_value=5, max_value=100, value=30)
+            blur_threshold = st.number_input(
+                "Blur Threshold",
+                value=100.0,
+                min_value=0.0,
+                step=10.0,
+                format="%.1f",
+                help="Laplacian variance threshold. Higher values reject more soft or motion-blurred frames.",
+            )
+        else:
+            max_video_frames = st.slider("Max Frames", min_value=5, max_value=60, value=20)
+            min_coverage = st.slider(
+                "Minimum Coverage",
+                min_value=0.05,
+                max_value=0.9,
+                value=0.3,
+                step=0.05,
+                help="Minimum image fraction covered by the checkerboard bounding area.",
+            )
+            min_angle_diff = st.slider(
+                "Minimum Angle Difference",
+                min_value=1.0,
+                max_value=45.0,
+                value=10.0,
+                step=1.0,
+                help="Reject near-duplicate board orientations and keep more viewpoint diversity.",
+            )
+
+        if video_file is not None and st.button("Extract Frames", type="primary"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp_path = Path(tmpdir)
+                suffix = Path(video_file.name).suffix or ".mp4"
+                video_path = tmp_path / f"uploaded_video{suffix}"
+                video_path.write_bytes(video_file.getvalue())
+                output_dir = tmp_path / "frames"
+                try:
+                    if extraction_mode == "Regular interval":
+                        extracted = extract_frames_from_video(
+                            video_path=video_path,
+                            output_dir=output_dir,
+                            interval_seconds=float(interval_seconds),
+                            max_frames=int(max_video_frames),
+                            min_blur_threshold=float(blur_threshold),
+                        )
+                    else:
+                        extracted = extract_frames_with_checkerboard(
+                            video_path=video_path,
+                            output_dir=output_dir,
+                            pattern_size=settings["checkerboard_pattern"],
+                            max_frames=int(max_video_frames),
+                            min_coverage=float(min_coverage),
+                            min_angle_diff=float(min_angle_diff),
+                        )
+                except Exception as exc:
+                    extracted = []
+                    st.error(f"Video extraction failed: {exc}")
+
+                st.session_state.extracted_frames = [
+                    {"name": path.name, "bytes": path.read_bytes()} for path in extracted if path.exists()
+                ]
+
+            if st.session_state.extracted_frames:
+                st.success(f"Extracted {len(st.session_state.extracted_frames)} frame(s).")
+            else:
+                st.warning("No usable frames were extracted. Try lowering the blur threshold or coverage requirements.")
+
+        extracted_frames: list[dict[str, Any]] = st.session_state.extracted_frames
+        if extracted_frames:
+            st.subheader("Extracted Frames")
+            preview_columns = st.columns(min(4, len(extracted_frames)))
+            for index, entry in enumerate(extracted_frames):
+                image = _bytes_to_image(entry["bytes"])
+                if image is None:
+                    continue
+                found, preview = _detect_preview(
+                    image,
+                    detection_mode,
+                    settings["checkerboard_pattern"],
+                    settings["checker_square_mm"],
+                    settings["charuco_board_size"],
+                    settings["charuco_square_mm"],
+                    settings["charuco_marker_mm"],
+                    settings["charuco_dictionary"],
+                )
+                with preview_columns[index % len(preview_columns)]:
+                    st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB), caption=entry["name"], use_container_width=True)
+                    st.caption("Detected" if found else "No board detected")
+
+            if st.button("Calibrate From Extracted Frames", type="primary"):
+                uploads = [MemoryUpload(entry["name"], entry["bytes"]) for entry in extracted_frames]
+                with st.spinner("Calibrating from extracted frames..."):
+                    point, diagnostics, files = _calibrate_files(
+                        uploads,
+                        focal_length=float(video_focal_length),
+                        mode=detection_mode,
+                        checkerboard_pattern=settings["checkerboard_pattern"],
+                        checker_square_mm=settings["checker_square_mm"],
+                        charuco_board_size=settings["charuco_board_size"],
+                        charuco_square_mm=settings["charuco_square_mm"],
+                        charuco_marker_mm=settings["charuco_marker_mm"],
+                        charuco_dictionary=settings["charuco_dictionary"],
+                    )
+                if point is None:
+                    used_images = sum(1 for item in diagnostics.image_results if item.used)
+                    st.error(
+                        f"Calibration failed. Only {used_images}/{len(diagnostics.image_results)} extracted frames were usable."
+                    )
+                else:
+                    profile.add_calibration(point)
+                    if diagnostics.image_size:
+                        profile.image_width, profile.image_height = diagnostics.image_size
+                    _store_run(float(video_focal_length), detection_mode, point, diagnostics, files, settings)
+                    _save_profile(profile)
+                    st.success(f"Calibration complete from video frames. RMS: {point.rms_error:.4f}px.")
+
+            current_video_run = st.session_state.calibration_runs.get(_run_key(float(video_focal_length)))
+            if current_video_run:
+                _render_calibration_visuals(current_video_run)
+
     with tab_nodal:
         st.header("Nodal Offset")
-        st.info("Measure these manually if you have a nodal rail or entrance-pupil test. LensU stores them per focal length for UE import.")
+        st.info(
+            "Measure these manually if you have a nodal rail or entrance-pupil test. LensU stores them per focal length for UE import."
+        )
 
-        nodal_focal = st.number_input("Focal Length (mm)", value=50.0, step=1.0, format="%.1f", key="nodal_focal")
+        nodal_focal = st.number_input(
+            "Focal Length (mm)",
+            value=50.0,
+            step=1.0,
+            format="%.1f",
+            key="nodal_focal",
+            help="Focal length associated with this nodal or entrance-pupil offset measurement.",
+        )
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("Location Offset (mm)")
-            nx = st.number_input("X", value=0.0, step=0.1, format="%.2f", key="nx")
-            ny = st.number_input("Y", value=0.0, step=0.1, format="%.2f", key="ny")
-            nz = st.number_input("Z", value=0.0, step=0.1, format="%.2f", key="nz")
+            nx = st.number_input(
+                "X",
+                value=0.0,
+                step=0.1,
+                format="%.2f",
+                key="nx",
+                help="Lateral offset in millimeters.",
+            )
+            ny = st.number_input(
+                "Y",
+                value=0.0,
+                step=0.1,
+                format="%.2f",
+                key="ny",
+                help="Vertical offset in millimeters.",
+            )
+            nz = st.number_input(
+                "Z",
+                value=0.0,
+                step=0.1,
+                format="%.2f",
+                key="nz",
+                help="Depth offset in millimeters from the tracked camera reference point.",
+            )
         with col2:
             st.subheader("Rotation Offset (deg)")
-            rx = st.number_input("Pitch", value=0.0, step=0.1, format="%.2f", key="rx")
-            ry = st.number_input("Yaw", value=0.0, step=0.1, format="%.2f", key="ry")
-            rz = st.number_input("Roll", value=0.0, step=0.1, format="%.2f", key="rz")
+            rx = st.number_input(
+                "Pitch",
+                value=0.0,
+                step=0.1,
+                format="%.2f",
+                key="rx",
+                help="Tilt adjustment in degrees.",
+            )
+            ry = st.number_input(
+                "Yaw",
+                value=0.0,
+                step=0.1,
+                format="%.2f",
+                key="ry",
+                help="Pan adjustment in degrees.",
+            )
+            rz = st.number_input(
+                "Roll",
+                value=0.0,
+                step=0.1,
+                format="%.2f",
+                key="rz",
+                help="Roll adjustment in degrees.",
+            )
 
         if st.button("Save Nodal Offset", type="primary"):
             profile.add_nodal_offset(
@@ -482,6 +990,7 @@ def main() -> None:
                     rotation_z=float(rz),
                 )
             )
+            _save_profile(profile)
             st.success(f"Nodal offset saved for {nodal_focal:.1f}mm.")
 
     with tab_profile:
@@ -492,13 +1001,29 @@ def main() -> None:
             if profile.calibration_points:
                 st.subheader("Calibration Points")
                 for point in profile.calibration_points:
-                    with st.expander(f"{point.focal_length_mm:.1f}mm | {point.detection_mode} | RMS {point.rms_error:.4f}px"):
+                    with st.expander(
+                        f"{point.focal_length_mm:.1f}mm | {point.detection_mode} | RMS {point.rms_error:.4f}px"
+                    ):
                         cols = st.columns(4)
-                        cols[0].metric("K1", f"{point.k1:.6f}")
-                        cols[1].metric("K2", f"{point.k2:.6f}")
-                        cols[2].metric("P1/P2", f"{point.p1:.6f} / {point.p2:.6f}")
+                        cols[0].metric(
+                            "K1",
+                            f"{point.k1:.6f}",
+                            help="Primary radial distortion term. Often dominates barrel or pincushion shape.",
+                        )
+                        cols[1].metric(
+                            "K2",
+                            f"{point.k2:.6f}",
+                            help="Secondary radial distortion term that refines edge behavior.",
+                        )
+                        cols[2].metric(
+                            "P1/P2",
+                            f"{point.p1:.6f} / {point.p2:.6f}",
+                            help="Tangential distortion terms, usually caused by lens element decentering.",
+                        )
                         cols[3].metric("Center", f"{point.cx:.4f}, {point.cy:.4f}")
-                        st.caption(f"Focal length in pixels: fx={point.fx:.2f}, fy={point.fy:.2f}. Images used: {point.num_images}.")
+                        st.caption(
+                            f"Focal length in pixels: fx={point.fx:.2f}, fy={point.fy:.2f}. Images used: {point.num_images}."
+                        )
 
             if len(profile.calibration_points) >= 2:
                 st.subheader("Zoom Interpolation")
@@ -510,9 +1035,15 @@ def main() -> None:
                 st.caption("Use at least 8-10 zoom points for production interpolation quality on cinema zooms.")
 
                 summary_cols = st.columns(3)
-                summary_cols[0].metric("Calibrated Range", f"{profile.calibration_points[0].focal_length_mm:.1f}-{profile.calibration_points[-1].focal_length_mm:.1f}mm")
+                summary_cols[0].metric(
+                    "Calibrated Range",
+                    f"{profile.calibration_points[0].focal_length_mm:.1f}-{profile.calibration_points[-1].focal_length_mm:.1f}mm",
+                )
                 summary_cols[1].metric("Points", str(len(profile.calibration_points)))
-                summary_cols[2].metric("Best Grade", min((accuracy_grade(p.rms_error) for p in profile.calibration_points), default="N/A"))
+                summary_cols[2].metric(
+                    "Best Grade",
+                    min((accuracy_grade(p.rms_error) for p in profile.calibration_points), default="N/A"),
+                )
 
             st.subheader("Nodal Offsets")
             if profile.nodal_offsets:
@@ -526,6 +1057,19 @@ def main() -> None:
                 st.caption("No nodal offsets recorded.")
 
             st.divider()
+            st.subheader("Profile Comparison")
+            uploaded_compare = st.file_uploader(
+                "Upload second profile JSON",
+                type=["json"],
+                key="compare_profile",
+                help="Compare this calibration against another day or another body setup to spot drift.",
+            )
+            if uploaded_compare is not None:
+                other_profile = _load_profile_from_upload(uploaded_compare.getvalue().decode("utf-8"))
+                comparison_rows = _compare_profiles(profile, other_profile)
+                st.dataframe(comparison_rows, use_container_width=True)
+
+            st.divider()
             profile_json = profile.to_dict()
             st.download_button(
                 "Download Profile (JSON)",
@@ -536,6 +1080,7 @@ def main() -> None:
             uploaded_profile = st.file_uploader("Load Profile", type=["json"], key="load_profile")
             if uploaded_profile is not None:
                 st.session_state.profile = _load_profile_from_upload(uploaded_profile.getvalue().decode("utf-8"))
+                _save_profile(st.session_state.profile)
                 st.success(f"Loaded profile: {st.session_state.profile.lens_name}")
                 st.rerun()
 
@@ -544,37 +1089,38 @@ def main() -> None:
         if not profile.calibration_points:
             st.warning("No calibration data available. Run at least one distortion calibration first.")
         else:
-            data_mode = st.radio("UE Data Mode", ["Parameters", "STMap"], horizontal=True)
-            st.caption("Parameters exports Brown-Conrady coefficients. STMap also packages float maps and imports them as textures in UE.")
+            data_mode = st.radio(
+                "UE Data Mode",
+                ["Parameters", "STMap"],
+                horizontal=True,
+                help="Parameters exports Brown-Conrady coefficients. STMap exports texture maps and JSON entries for texture-driven distortion.",
+            )
+            include_stmaps = st.checkbox(
+                "Include STMaps in ZIP",
+                value=data_mode == "STMap",
+                help="Package generated STMap textures inside the ZIP even when exporting parameter-driven data.",
+            )
+            st.caption("STMaps are useful for texture-driven workflows or for inspection alongside the parameter fit.")
 
             if st.button("Generate UE Export Package", type="primary"):
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    tmp_path = Path(tmpdir)
-                    stmap_dir = tmp_path / "stmaps"
-                    json_path = export_ue_json(profile, tmp_path, data_mode=data_mode, stmap_directory=stmap_dir)
-                    script_path = export_ue_python_script(profile, json_path.name, tmp_path, data_mode=data_mode)
+                st.session_state.export_bundle = _prepare_export_bundle(profile, data_mode, include_stmaps)
 
-                    zip_buffer = io.BytesIO()
-                    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-                        archive.write(json_path, json_path.name)
-                        archive.write(script_path, script_path.name)
-                        if stmap_dir.exists():
-                            for stmap_file in stmap_dir.iterdir():
-                                archive.write(stmap_file, stmap_file.name)
-                    zip_buffer.seek(0)
+            bundle = st.session_state.export_bundle
+            if bundle:
+                st.metric("ZIP Size", _format_zip_size(bundle["zip_size"]))
+                st.download_button(
+                    "Download UE Export Package (.zip)",
+                    data=bundle["bytes"],
+                    file_name=bundle["name"],
+                    mime="application/zip",
+                )
 
-                    st.download_button(
-                        "Download UE Export Package (.zip)",
-                        data=zip_buffer,
-                        file_name=f"LensU_{profile.lens_name.replace(' ', '_')}_{data_mode}.zip",
-                        mime="application/zip",
-                    )
-
-                    st.subheader("Generated Files Preview")
-                    with st.expander("Calibration JSON"):
-                        st.json(json.loads(json_path.read_text(encoding="utf-8")))
-                    with st.expander("UE Python Script"):
-                        st.code(script_path.read_text(encoding="utf-8"), language="python")
+                st.subheader("Generated Files Preview")
+                with st.expander("Calibration JSON"):
+                    st.json(json.loads(bundle["json_text"]))
+                with st.expander("UE Python Script"):
+                    st.code(bundle["script_text"], language="python")
+                    _copy_text_button("Copy to clipboard", bundle["script_text"], key="copy_ue_script")
 
             st.divider()
             st.markdown(
@@ -585,6 +1131,9 @@ def main() -> None:
 4. The script creates `/Game/LensU/<LensName>` and imports STMaps when `STMap` mode is selected.
                 """
             )
+
+    _save_profile(profile)
+    _render_footer()
 
 
 if __name__ == "__main__":
