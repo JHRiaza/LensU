@@ -1,150 +1,137 @@
-# AGENTS.md — LensU Sprint 8: REST API + Multi-Camera + Nuke Export
+# AGENTS.md — LensU Sprint 9: LiveLink Emulator + Calibration Wizard + Polish
 
 ## Goal
-Add a REST API for external tool integration, multi-camera calibration support, and Nuke-compatible export.
+Add a LiveLink-compatible data emitter so LensU can stream lens data directly into UE without file export, a guided calibration wizard for beginners, and final polish.
 
 ## Tasks
 
-### 1. REST API Server (NEW: src/api.py)
+### 1. LiveLink UDP Emitter (NEW: src/livelink_emitter.py)
 
-A lightweight FastAPI/Flask server so external tools can trigger calibration programmatically:
-
-Since we want NO new dependencies, use Python's built-in `http.server` with a simple JSON API:
+Stream calibrated lens data to UE via LiveLink protocol (UDP JSON):
 
 ```python
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import socket
 import json
+import time
 
-class LensUAPIHandler(BaseHTTPRequestHandler):
-    """Simple REST API for LensU.
+class LiveLinkEmitter:
+    """Emit lens calibration data to UE LiveLink over UDP.
     
-    Endpoints:
+    UE's LiveLink can receive custom JSON data via UDP.
+    This emitter sends lens parameters that UE can map to a CineCamera.
     
-    GET /api/status
-      Returns: {"status": "ok", "version": "1.5.0"}
-    
-    GET /api/library
-      Returns: list of saved lens profiles
-    
-    GET /api/library/{name}
-      Returns: specific profile data
-    
-    POST /api/calibrate
-      Body: {"images_dir": "path", "focal_length_mm": 50, "pattern_size": [9,6], "sensor": "full-frame"}
-      Returns: {"calibration_point": {...}, "rms_error": 0.3, "images_used": 15}
-    
-    POST /api/batch
-      Body: {"base_dir": "path", "sensor": "super35"}
-      Returns: {"profile": {...}, "focal_lengths_calibrated": [24, 35, 50]}
-    
-    POST /api/export
-      Body: {"profile_name": "my_lens", "format": "ue", "include_stmaps": true}
-      Returns: ZIP file as binary
-    
-    GET /api/presets
-      Returns: list of available preset profiles
-    
-    GET /api/presets/{name}
-      Returns: preset profile data
+    Message format (UE LiveLink JSON):
+    {
+        "SubjectName": "LensU",
+        "FrameNumber": 0,
+        "FocalLength": 50.0,
+        "Aperture": 2.8,
+        "FocusDistance": 3.0,
+        "DistortionParameters": [k1, k2, p1, p2, k3],
+        "ImageCenter": [cx, cy],
+        "NodalOffset": [x, y, z, pitch, yaw, roll]
+    }
     """
-
-def start_api_server(host: str = "0.0.0.0", port: int = 8600):
-    """Start the LensU API server."""
+    
+    def __init__(self, target_ip: str = "127.0.0.1", port: int = 11111):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.target = (target_ip, port)
+        self.frame = 0
+    
+    def send_static_profile(self, profile: LensProfile, focal_length_mm: float):
+        """Send a static lens profile (useful for fixed prime lenses)."""
+        
+    def send_fiz_update(self, focus: float, iris: float, zoom: float, profile: LensProfile):
+        """Send interpolated lens data based on current FIZ values.
+        Uses the profile's calibration tables to interpolate distortion
+        at the current focus/zoom position.
+        """
+    
+    def start_streaming(self, profile: LensProfile, fps: int = 24):
+        """Start continuous streaming at specified frame rate."""
+        
+    def stop_streaming(self):
+        """Stop streaming."""
 ```
 
-Add CLI command: `lensu serve --port 8600`
+Add "LiveLink" section in the Live Tracking tab:
+- Target IP and port configuration
+- Start/Stop streaming buttons
+- Frame counter display
+- Option to stream static profile or receive FIZ from FreeD/OpenTrackIO and forward interpolated data
 
-### 2. Multi-Camera Support (calibration.py + app.py)
+### 2. Calibration Wizard (NEW: src/wizard.py)
 
-VP stages often have multiple cameras. Add ability to manage calibrations for multiple cameras in one session:
-
-Add to calibration.py:
-```python
-@dataclass
-class CameraRig:
-    """A collection of cameras with their lens profiles."""
-    rig_name: str = "Default Rig"
-    cameras: dict[str, LensProfile] = field(default_factory=dict)
-    # Key = camera label (e.g., "Camera A", "Main", "Witness")
-    
-    def add_camera(self, label: str, profile: LensProfile):
-        self.cameras[label] = profile
-    
-    def to_dict(self) -> dict:
-        return {
-            "rig_name": self.rig_name,
-            "cameras": {k: v.to_dict() for k, v in self.cameras.items()}
-        }
-    
-    def save_json(self, path: Path):
-        path.write_text(json.dumps(self.to_dict(), indent=2))
-```
-
-In Streamlit sidebar, add camera selector:
-- "Add Camera" button
-- Camera label input
-- Switch between cameras
-- Each camera has its own LensProfile
-- Export all cameras as a multi-camera UE package
-
-### 3. Nuke Export (NEW: src/nuke_export.py)
-
-Export calibration data for The Foundry Nuke (common in VP post-production):
+A step-by-step guided workflow for first-time users:
 
 ```python
-def export_nuke_script(
-    profile: LensProfile,
-    output_path: Path,
-) -> Path:
-    """Generate a Nuke .nk script with LensDistortion node.
+def calibration_wizard_ui():
+    """Streamlit multi-step wizard for complete lens calibration.
     
-    Creates a Nuke script containing:
-    - LensDistortion node with calibrated k1, k2, k3, p1, p2 values
-    - Correct image format (resolution + pixel aspect)
-    - STMap generator setup for undistortion
-    - Read node placeholder for plate input
-    
-    Nuke LensDistortion node uses similar Brown-Conrady model to OpenCV.
-    """
-
-def export_nuke_gizmo(
-    profile: LensProfile,
-    output_path: Path,
-) -> Path:
-    """Generate a Nuke .gizmo for reusable lens correction.
-    
-    A gizmo is a reusable Nuke node group that:
-    - Takes input plate
-    - Applies undistortion using calibrated parameters
-    - Has knobs for adjusting parameters
-    - Includes lens info in label
+    Step 1: "Welcome" - Explain what LensU does, what you'll need
+    Step 2: "Lens Info" - Name, type (prime/zoom/anamorphic), sensor size
+    Step 3: "Calibration Board" - Generate and download a printable board
+    Step 4: "Capture Images" - Instructions for good calibration shots
+           - Upload images OR use live camera
+           - Show real-time coverage feedback
+    Step 5: "Calibrate" - Run calibration, show results
+           - Accuracy grade with explanation
+           - Option to exclude bad images and re-run
+    Step 6: "Nodal Offset" - Optional: guided parallax test OR manual entry
+    Step 7: "Zoom Points" - For zoom lenses: repeat steps 4-5 at each focal length
+    Step 8: "Export" - Choose export format (UE, Nuke, or both)
+           - Download package
+           - Show UE import instructions
+    Step 9: "Save" - Save to library with name and notes
     """
 ```
 
-Add Nuke export option in the Export tab alongside UE export.
+Add "Wizard" as the FIRST tab in Streamlit (before advanced tabs).
 
-### 4. Update Tests
+### 3. Final Polish
 
-Add tests for:
-- API endpoint responses (mock HTTP)
-- CameraRig serialization
-- Nuke script generation (check output contains expected node names)
-- Encoder mapping interpolation accuracy
+a) **Error recovery**: Wrap all calibration operations in try/except with user-friendly error messages. No tracebacks in the UI.
+
+b) **Session auto-save**: Auto-save current work to `~/.lensu/autosave.json` every time a calibration is run or profile is modified. On app start, offer to restore autosaved session.
+
+c) **Dark theme**: Add Streamlit theme config in `.streamlit/config.toml`:
+```toml
+[theme]
+primaryColor = "#FF6B35"
+backgroundColor = "#0E1117"
+secondaryBackgroundColor = "#1E2130"
+textColor = "#FAFAFA"
+font = "sans serif"
+```
+
+d) **App icon and page config**: Update st.set_page_config with proper title, icon, and layout.
+
+e) **Footer**: Add version number, link to docs, "Made for Virtual Production" tagline.
+
+### 4. Update README
+
+Add new features to README:
+- LiveLink streaming
+- REST API (`lensu serve`)
+- Nuke export
+- Multi-camera support
+- Calibration wizard
+- Complete feature list
 
 ## Quality Requirements
-- API server must be optional (not started by default)
-- No new pip dependencies (use stdlib http.server)
-- Multi-camera must not break single-camera workflow
-- Nuke export must produce valid .nk syntax
-- All existing tests must pass + new tests
+- LiveLink emitter must not block the UI
+- Wizard must work for complete beginners (no assumed knowledge)
+- Auto-save must not corrupt data on crash
+- All 22+ tests must still pass
+- No new pip dependencies
 
 ## Test Plan
 1. All imports succeed
 2. `python -m pytest src/tests/ -v` — all tests pass
-3. API server starts and responds to GET /api/status
-4. Multi-camera CameraRig serializes/deserializes correctly
-5. Nuke export generates parseable .nk file
-6. `streamlit run src/app.py` — app works with multi-camera selector
+3. `streamlit run src/app.py` — app launches with wizard as first tab
+4. Dark theme applied
+5. LiveLink emitter creates socket without error
+6. Auto-save file created at ~/.lensu/autosave.json
 
 When completely finished, run:
-openclaw system event --text "Done: LensU Sprint 8 -- REST API, multi-camera, Nuke export" --mode now
+openclaw system event --text "Done: LensU Sprint 9 -- LiveLink, wizard, polish" --mode now
