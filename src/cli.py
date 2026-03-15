@@ -23,7 +23,7 @@ try:
     from .nuke_export import export_nuke_gizmo, export_nuke_script
     from .ue_export import export_ue_json, export_ue_python_script
 except ImportError:
-    __version__ = "1.5.0"
+    __version__ = "1.7.0"
     from api import start_api_server
     from batch import batch_calibrate_detailed
     from board_generator import generate_charuco_pdf, generate_checkerboard_pdf

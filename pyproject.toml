@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lensu"
-version = "1.6.0"
+version = "1.7.0"
 description = "Cinema lens calibration tool for Unreal Engine virtual production"
 readme = "README.md"
 license = {text = "MIT"}

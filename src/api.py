@@ -22,7 +22,7 @@ try:
     from .temp_paths import lensu_tempdir
     from .ue_export import export_ue_json, export_ue_python_script
 except ImportError:
-    __version__ = "1.5.0"
+    __version__ = "1.7.0"
     from batch import batch_calibrate_detailed
     from calibration import CalibrationPoint, LensProfile, calibrate_from_images
     from lens_library import list_library, load_from_library
@@ -172,7 +172,7 @@ def _build_export_zip(profile: LensProfile, export_format: str, include_stmaps: 
 class LensUAPIHandler(BaseHTTPRequestHandler):
     """Simple REST API for LensU."""
 
-    server_version = "LensUAPI/1.5.0"
+    server_version = "LensUAPI/1.7.0"
 
     def log_message(self, format: str, *args) -> None:
         return

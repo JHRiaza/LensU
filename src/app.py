@@ -119,7 +119,7 @@ except ImportError:
     from wizard import calibration_wizard_ui
 
 
-APP_VERSION = f"v{__version__}" if "__version__" in globals() else "v1.6.0"
+APP_VERSION = f"v{__version__}" if "__version__" in globals() else "v1.7.0"
 
 
 def _state_dir() -> Path:

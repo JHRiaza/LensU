@@ -16,7 +16,7 @@ try:
     from . import __version__
     from .temp_paths import lensu_tempdir
 except ImportError:
-    __version__ = "1.5.0"
+    __version__ = "1.7.0"
     from temp_paths import lensu_tempdir
 
 LENSU_VERSION = __version__
