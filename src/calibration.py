@@ -97,7 +97,9 @@ class LensProfile:
 
     lens_name: str = "Unknown Lens"
     lens_family: str = ""
+    manufacturer: str = ""
     lens_type: str = "prime"
+    mount: str = ""
     sensor_width_mm: float = 36.0
     sensor_height_mm: float = 24.0
     image_width: int = 1920
@@ -108,6 +110,8 @@ class LensProfile:
     anamorphic: Optional[AnamorphicInfo] = None
     notes: str = ""
     source: str = ""
+    color_science: str = ""
+    working_colorspace: str = ""
     encoder_mappings: dict[str, list[dict[str, float]]] = field(default_factory=dict)
 
     def add_calibration(self, point: CalibrationPoint) -> None:
@@ -221,13 +225,17 @@ def lens_profile_from_dict(data: dict) -> LensProfile:
     profile = LensProfile(
         lens_name=data.get("lens_name", "Unknown"),
         lens_family=data.get("lens_family", ""),
+        manufacturer=data.get("manufacturer", ""),
         lens_type=data.get("lens_type", data.get("type", "prime")),
+        mount=data.get("mount", ""),
         sensor_width_mm=data.get("sensor_width_mm", 36.0),
         sensor_height_mm=data.get("sensor_height_mm", 24.0),
         image_width=data.get("image_width", 1920),
         image_height=data.get("image_height", 1080),
         notes=data.get("notes", ""),
         source=data.get("source", ""),
+        color_science=data.get("color_science", ""),
+        working_colorspace=data.get("working_colorspace", ""),
         encoder_mappings=data.get("encoder_mappings", {}) or {},
     )
     for point in data.get("calibration_points", []):
@@ -329,7 +337,9 @@ def merge_profiles(
     merged = LensProfile(
         lens_name=latest_profile.lens_name or profiles[0].lens_name,
         lens_family=latest_profile.lens_family or profiles[0].lens_family,
+        manufacturer=latest_profile.manufacturer or profiles[0].manufacturer,
         lens_type=latest_profile.lens_type or profiles[0].lens_type,
+        mount=latest_profile.mount or profiles[0].mount,
         sensor_width_mm=latest_profile.sensor_width_mm or profiles[0].sensor_width_mm,
         sensor_height_mm=latest_profile.sensor_height_mm or profiles[0].sensor_height_mm,
         image_width=latest_profile.image_width or profiles[0].image_width,
@@ -337,6 +347,8 @@ def merge_profiles(
         anamorphic=latest_profile.anamorphic or profiles[0].anamorphic,
         notes="\n".join(filter(None, [profile.notes for profile in profiles])),
         source=f"Merged {len(profiles)} profiles ({strategy})",
+        color_science=latest_profile.color_science or profiles[0].color_science,
+        working_colorspace=latest_profile.working_colorspace or profiles[0].working_colorspace,
         encoder_mappings=_merge_encoder_mappings(profiles),
     )
 

@@ -25,9 +25,13 @@ class CalibrationTests(unittest.TestCase):
         profile = LensProfile(
             lens_name="Roundtrip Lens",
             lens_family="Test Family",
+            manufacturer="Cooke",
             lens_type="prime",
+            mount="PL",
             notes="Approximate",
             source="Unit test",
+            color_science="ARRI LogC4",
+            working_colorspace="ACEScg",
             encoder_mappings={"focus": [{"encoder": 0.0, "value": 1.0}]},
             anamorphic=AnamorphicInfo(squeeze_ratio=1.5, desqueeze_applied=True),
         )
@@ -40,8 +44,12 @@ class CalibrationTests(unittest.TestCase):
 
         self.assertEqual(loaded.lens_name, "Roundtrip Lens")
         self.assertEqual(loaded.lens_family, "Test Family")
+        self.assertEqual(loaded.manufacturer, "Cooke")
+        self.assertEqual(loaded.mount, "PL")
         self.assertEqual(loaded.notes, "Approximate")
         self.assertEqual(loaded.source, "Unit test")
+        self.assertEqual(loaded.color_science, "ARRI LogC4")
+        self.assertEqual(loaded.working_colorspace, "ACEScg")
         self.assertEqual(loaded.encoder_mappings["focus"][0]["value"], 1.0)
         self.assertIsNotNone(loaded.anamorphic)
         self.assertEqual(loaded.anamorphic.squeeze_ratio, 1.5)

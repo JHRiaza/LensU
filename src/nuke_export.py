@@ -36,6 +36,11 @@ Read {{
  file "/path/to/plate.exr"
  name Read_Plate
 }}
+# LensU metadata:
+# Manufacturer: {profile.manufacturer or "Unknown"}
+# Mount: {profile.mount or "Unknown"}
+# Color Science: {profile.color_science or "Unknown"}
+# Working Colorspace: {profile.working_colorspace or "Unknown"}
 LensDistortion {{
  output undistort
  distortion1 {point.k1:.10f}
@@ -79,6 +84,7 @@ def export_nuke_gizmo(
  addUserKnob {{7 p1 l p1 T {point.p1:.10f}}}
  addUserKnob {{7 p2 l p2 T {point.p2:.10f}}}
  addUserKnob {{26 lens_info l "" T "{profile.lens_name} | {point.focal_length_mm:.1f}mm"}}
+ addUserKnob {{26 color_info l "" T "{profile.color_science or 'Unknown'} | {profile.working_colorspace or 'Unknown'}"}}
 }}
  Input {{
   name Input1

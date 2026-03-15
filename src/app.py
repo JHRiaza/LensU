@@ -63,6 +63,7 @@ try:
         save_to_library,
         search_library,
     )
+    from .lens_database import export_open_format, import_open_format, validate_open_format
     from .livelink_emitter import LiveLinkEmitter
     from .live_calibration import live_calibration_ui
     from .nuke_export import export_nuke_gizmo, export_nuke_script
@@ -124,6 +125,7 @@ except ImportError:
         save_to_library,
         search_library,
     )
+    from lens_database import export_open_format, import_open_format, validate_open_format
     from livelink_emitter import LiveLinkEmitter
     from live_calibration import live_calibration_ui
     from nuke_export import export_nuke_gizmo, export_nuke_script
@@ -248,6 +250,8 @@ if "batch_results" not in st.session_state:
     st.session_state.batch_results = []
 if "library_export_bundle" not in st.session_state:
     st.session_state.library_export_bundle = None
+if "community_open_export" not in st.session_state:
+    st.session_state.community_open_export = None
 if "report_download" not in st.session_state:
     st.session_state.report_download = None
 if "comparison_report_download" not in st.session_state:
@@ -798,6 +802,17 @@ def _suggest_zoom_points(min_mm: float, max_mm: float) -> list[float]:
 def _load_profile_from_upload(payload: bytes) -> LensProfile:
     data = json.loads(payload)
     return lens_profile_from_dict(data)
+
+
+def _prepare_open_format_bundle(profile: LensProfile) -> dict[str, Any]:
+    with lensu_tempdir() as tmpdir:
+        tmp_path = Path(tmpdir)
+        export_path = export_open_format(profile, tmp_path / f"{profile.lens_name.replace(' ', '_')}.lensu.json")
+        return {
+            "name": export_path.name,
+            "bytes": export_path.read_bytes(),
+            "text": export_path.read_text(encoding="utf-8"),
+        }
 
 
 def _run_for_point(point: CalibrationPoint) -> dict[str, Any] | None:
@@ -1556,10 +1571,16 @@ def main() -> None:
             else:
                 template = LensProfile(
                     lens_name=profile.lens_name,
+                    lens_family=profile.lens_family,
+                    manufacturer=profile.manufacturer,
+                    lens_type=profile.lens_type,
+                    mount=profile.mount,
                     sensor_width_mm=profile.sensor_width_mm,
                     sensor_height_mm=profile.sensor_height_mm,
                     image_width=profile.image_width,
                     image_height=profile.image_height,
+                    color_science=profile.color_science,
+                    working_colorspace=profile.working_colorspace,
                 )
                 rig.add_camera(candidate, template)
                 st.session_state.selected_camera_label = candidate
@@ -1574,6 +1595,30 @@ def main() -> None:
             value=profile.lens_name,
             help="Profile name used in JSON and Unreal export file names.",
         )
+        meta1, meta2 = st.columns(2)
+        with meta1:
+            profile.manufacturer = st.text_input("Manufacturer", value=profile.manufacturer)
+            profile.mount = st.text_input("Mount", value=profile.mount, help="PL, EF, E, LPL, RF, MFT, etc.")
+        with meta2:
+            profile.lens_type = st.selectbox(
+                "Lens Type",
+                ["prime", "zoom", "anamorphic"],
+                index=max(["prime", "zoom", "anamorphic"].index(profile.lens_type or "prime"), 0),
+            )
+            profile.lens_family = st.text_input("Lens Family", value=profile.lens_family)
+        color1, color2 = st.columns(2)
+        with color1:
+            profile.color_science = st.text_input(
+                "Sensor Color Science",
+                value=profile.color_science,
+                help="ARRI LogC4, RED IPP2, Sony S-Log3/S-Gamut3.Cine, etc.",
+            )
+        with color2:
+            profile.working_colorspace = st.text_input(
+                "Working Colorspace",
+                value=profile.working_colorspace,
+                help="ACEScg, Linear sRGB, Rec.709, etc.",
+            )
         preset_rows = list_presets()
         preset_labels = ["None"] + [item["name"] for item in preset_rows]
         selected_preset = st.selectbox(
@@ -1785,6 +1830,7 @@ def main() -> None:
         tab_nodal,
         tab_profile,
         tab_library,
+        tab_community,
         tab_export,
     ) = st.tabs(
         [
@@ -1798,6 +1844,7 @@ def main() -> None:
             "Nodal Offset",
             "Lens Profile",
             "Lens Library",
+            "Community",
             "UE Export",
         ]
     )
@@ -2782,6 +2829,79 @@ def main() -> None:
                     f"Selected: {selected_row['name']} | Sensor {selected_row['sensor']} | "
                     f"Focals {selected_row['focal_lengths']} | RMS avg {selected_row['rms_avg']:.4f}"
                 )
+
+    with tab_community:
+        st.header("Community")
+        st.info("Browse bundled presets and exchange open LensU community profiles with validation on import.")
+
+        st.subheader("Preset Browser")
+        preset_rows = list_presets()
+        if preset_rows:
+            st.dataframe(preset_rows, use_container_width=True)
+            selected_community_preset = st.selectbox(
+                "Preset",
+                [row["name"] for row in preset_rows],
+                key="community_preset_select",
+            )
+            if st.button("Load Preset Into Session", key="community_load_preset"):
+                rig.cameras[st.session_state.selected_camera_label] = load_preset(selected_community_preset)
+                st.session_state.profile = rig.cameras[st.session_state.selected_camera_label]
+                _save_profile(st.session_state.profile)
+                _save_rig(rig)
+                st.success(f"Loaded preset: {st.session_state.profile.lens_name}")
+                st.rerun()
+        else:
+            st.caption("No bundled presets were found.")
+
+        st.divider()
+        st.subheader("Open Lens Database Format")
+        uploaded_open_profile = st.file_uploader(
+            "Import .lensu.json",
+            type=["json"],
+            key="community_open_import",
+            help="Imports LensU community format files after validation.",
+        )
+        if uploaded_open_profile is not None:
+            with lensu_tempdir() as tmpdir:
+                temp_path = Path(tmpdir) / uploaded_open_profile.name
+                temp_path.write_bytes(uploaded_open_profile.getvalue())
+                valid, errors = validate_open_format(temp_path)
+                if valid:
+                    st.success("Open format validation passed.")
+                    if st.button("Import Community Profile", key="community_open_import_button"):
+                        try:
+                            rig.cameras[st.session_state.selected_camera_label] = import_open_format(temp_path)
+                            st.session_state.profile = rig.cameras[st.session_state.selected_camera_label]
+                            _save_profile(st.session_state.profile)
+                            _save_rig(rig)
+                            st.success(f"Imported: {st.session_state.profile.lens_name}")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(
+                                f"Could not import the selected community profile. {_safe_user_message(exc, 'Import failed.')}"
+                            )
+                else:
+                    st.error("Validation failed for the selected community profile.")
+                    st.write(errors)
+
+        if st.button("Export Current Profile As .lensu.json", key="community_export_open"):
+            try:
+                st.session_state.community_open_export = _prepare_open_format_bundle(profile)
+            except Exception as exc:
+                st.error(
+                    f"Could not export the current community profile. {_safe_user_message(exc, 'Export failed.')}"
+                )
+        open_bundle = st.session_state.community_open_export
+        if open_bundle:
+            st.download_button(
+                "Download .lensu.json",
+                data=open_bundle["bytes"],
+                file_name=open_bundle["name"],
+                mime="application/json",
+                key="community_open_download",
+            )
+            with st.expander("Open Format Preview"):
+                st.json(json.loads(open_bundle["text"]))
 
     with tab_export:
         st.header("Export")

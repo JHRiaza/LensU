@@ -42,6 +42,9 @@ def export_ue_json(
         "data_mode": data_mode,
         "lens_info": {
             "lens_name": profile.lens_name,
+            "manufacturer": profile.manufacturer,
+            "mount": profile.mount,
+            "lens_type": profile.lens_type,
             "sensor_width_mm": profile.sensor_width_mm,
             "sensor_height_mm": profile.sensor_height_mm,
             "image_width": profile.image_width,
@@ -58,6 +61,8 @@ def export_ue_json(
         "user_metadata": {
             "generator": "LensU",
             "version": LENSU_VERSION,
+            "color_science": profile.color_science,
+            "working_colorspace": profile.working_colorspace,
             "breathing_ratio_by_focal_length": breathing_summary,
             "anamorphic": (
                 {

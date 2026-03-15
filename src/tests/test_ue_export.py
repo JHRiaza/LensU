@@ -9,7 +9,15 @@ from ue_export import export_ue_json, export_ue_python_script
 
 
 def _sample_profile() -> LensProfile:
-    profile = LensProfile(lens_name="UE Test Lens", image_width=1920, image_height=1080)
+    profile = LensProfile(
+        lens_name="UE Test Lens",
+        manufacturer="ARRI",
+        mount="LPL",
+        color_science="ARRI LogC4",
+        working_colorspace="ACEScg",
+        image_width=1920,
+        image_height=1080,
+    )
     profile.add_calibration(
         CalibrationPoint(
             focal_length_mm=50.0,
@@ -34,6 +42,9 @@ class UEExportTests(unittest.TestCase):
             json_path = export_ue_json(profile, tmpdir)
             payload = json.loads(json_path.read_text(encoding="utf-8"))
         self.assertEqual(payload["lens_info"]["lens_name"], "UE Test Lens")
+        self.assertEqual(payload["lens_info"]["manufacturer"], "ARRI")
+        self.assertEqual(payload["lens_info"]["mount"], "LPL")
+        self.assertEqual(payload["user_metadata"]["color_science"], "ARRI LogC4")
         self.assertEqual(payload["distortion_table"][0]["distortion_info"]["parameters"][0], -0.01)
         self.assertEqual(payload["focal_length_table"][0]["zoom"], 50.0)
 
