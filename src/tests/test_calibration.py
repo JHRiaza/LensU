@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from calibration import AnamorphicInfo, CalibrationPoint, CameraRig, LensProfile
+from calibration import AnamorphicInfo, CalibrationPoint, CameraRig, LensProfile, merge_profiles
 from test_support import workspace_tempdir
 
 
@@ -81,6 +81,36 @@ class CalibrationTests(unittest.TestCase):
         self.assertEqual(sorted(loaded.cameras.keys()), ["Main", "Witness"])
         self.assertEqual(loaded.cameras["Main"].calibration_points[0].focal_length_mm, 35.0)
         self.assertEqual(loaded.cameras["Witness"].lens_name, "Witness Cam")
+
+    def test_merge_profiles_best_rms(self):
+        first = LensProfile(lens_name="Merge Lens", notes="First")
+        first.add_calibration(CalibrationPoint(focal_length_mm=35.0, k1=-0.03, rms_error=0.5, num_images=8))
+        first.add_calibration(CalibrationPoint(focal_length_mm=50.0, k1=-0.02, rms_error=0.35, num_images=7))
+        second = LensProfile(lens_name="Merge Lens", notes="Second")
+        second.add_calibration(CalibrationPoint(focal_length_mm=35.0, k1=-0.01, rms_error=0.2, num_images=10))
+        second.add_calibration(CalibrationPoint(focal_length_mm=85.0, k1=-0.04, rms_error=0.25, num_images=6))
+
+        merged = merge_profiles([first, second], strategy="best_rms")
+
+        self.assertEqual([point.focal_length_mm for point in merged.calibration_points], [35.0, 50.0, 85.0])
+        self.assertEqual(merged.calibration_points[0].k1, -0.01)
+        self.assertEqual(merged.calibration_points[0].rms_error, 0.2)
+        self.assertIn("Merged 2 profiles", merged.source)
+        self.assertIn("First", merged.notes)
+        self.assertIn("Second", merged.notes)
+
+    def test_merge_profiles_average(self):
+        first = LensProfile(lens_name="Average Lens")
+        first.add_calibration(CalibrationPoint(focal_length_mm=50.0, k1=-0.04, k2=0.01, rms_error=0.4, num_images=5))
+        second = LensProfile(lens_name="Average Lens")
+        second.add_calibration(CalibrationPoint(focal_length_mm=50.0, k1=-0.02, k2=0.03, rms_error=0.2, num_images=7))
+
+        merged = merge_profiles([first, second], strategy="average")
+
+        self.assertEqual(len(merged.calibration_points), 1)
+        self.assertAlmostEqual(merged.calibration_points[0].k1, -0.03, places=6)
+        self.assertAlmostEqual(merged.calibration_points[0].k2, 0.02, places=6)
+        self.assertEqual(merged.calibration_points[0].num_images, 12)
 
 
 if __name__ == "__main__":

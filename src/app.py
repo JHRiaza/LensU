@@ -46,7 +46,14 @@ try:
         camera_rig_from_dict,
         lens_profile_from_dict,
         measured_focal_length_mm,
+        merge_profiles,
         undistort_image,
+    )
+    from .distortion_viz import (
+        compare_distortion_profiles,
+        render_distortion_grid,
+        render_distortion_magnitude_map,
+        render_distortion_vector_field,
     )
     from .encoder_mapping import create_mapping_from_samples
     from .lens_library import (
@@ -62,6 +69,11 @@ try:
     from .presets import list_presets, load_preset
     from .protocols.freed import FreeDPacket, freed_to_fiz, start_freed_listener
     from .protocols.opentrackio import OpenTrackIOSample, map_opentrackio_fiz, start_opentrackio_listener
+    from .quality_analyzer import (
+        analyze_calibration_quality,
+        detect_systematic_error,
+        generate_coverage_heatmap,
+    )
     from .report import generate_calibration_report, generate_comparison_report
     from .session_autosave import autosave_exists, load_autosave, write_autosave
     from .temp_paths import lensu_tempdir
@@ -95,7 +107,14 @@ except ImportError:
         camera_rig_from_dict,
         lens_profile_from_dict,
         measured_focal_length_mm,
+        merge_profiles,
         undistort_image,
+    )
+    from distortion_viz import (
+        compare_distortion_profiles,
+        render_distortion_grid,
+        render_distortion_magnitude_map,
+        render_distortion_vector_field,
     )
     from encoder_mapping import create_mapping_from_samples
     from lens_library import (
@@ -111,6 +130,7 @@ except ImportError:
     from presets import list_presets, load_preset
     from protocols.freed import FreeDPacket, freed_to_fiz, start_freed_listener
     from protocols.opentrackio import OpenTrackIOSample, map_opentrackio_fiz, start_opentrackio_listener
+    from quality_analyzer import analyze_calibration_quality, detect_systematic_error, generate_coverage_heatmap
     from report import generate_calibration_report, generate_comparison_report
     from session_autosave import autosave_exists, load_autosave, write_autosave
     from temp_paths import lensu_tempdir
@@ -778,6 +798,20 @@ def _suggest_zoom_points(min_mm: float, max_mm: float) -> list[float]:
 def _load_profile_from_upload(payload: bytes) -> LensProfile:
     data = json.loads(payload)
     return lens_profile_from_dict(data)
+
+
+def _run_for_point(point: CalibrationPoint) -> dict[str, Any] | None:
+    return st.session_state.calibration_runs.get(_run_key(point.focal_length_mm))
+
+
+def _write_run_images(files: list[dict[str, Any]], temp_dir: Path) -> list[Path]:
+    image_paths: list[Path] = []
+    for index, entry in enumerate(files):
+        filename = entry["name"]
+        output_path = temp_dir / f"{index:03d}_{filename}"
+        output_path.write_bytes(entry["bytes"])
+        image_paths.append(output_path)
+    return image_paths
 
 
 def _copy_text_button(label: str, text: str, key: str) -> None:
@@ -2394,6 +2428,86 @@ def main() -> None:
                                 ],
                                 use_container_width=True,
                             )
+                        image_size = (max(profile.image_width, 1), max(profile.image_height, 1))
+                        grid_image = render_distortion_grid(point, image_size)
+                        magnitude_image = render_distortion_magnitude_map(point, image_size)
+                        vector_image = render_distortion_vector_field(point, image_size)
+                        viz_cols = st.columns(3)
+                        with viz_cols[0]:
+                            st.image(
+                                cv2.cvtColor(grid_image, cv2.COLOR_BGR2RGB),
+                                caption="Distortion Grid",
+                                use_container_width=True,
+                            )
+                        with viz_cols[1]:
+                            st.image(
+                                cv2.cvtColor(magnitude_image, cv2.COLOR_BGR2RGB),
+                                caption="Magnitude Map",
+                                use_container_width=True,
+                            )
+                        with viz_cols[2]:
+                            st.image(
+                                cv2.cvtColor(vector_image, cv2.COLOR_BGR2RGB),
+                                caption="Vector Field",
+                                use_container_width=True,
+                            )
+
+                        run = _run_for_point(point)
+                        if run is None:
+                            st.caption("Quality analysis is available for calibration runs captured in the current session.")
+                        elif run["mode"] != "Checkerboard":
+                            st.caption("Quality analyzer currently targets checkerboard sessions captured in this app session.")
+                        else:
+                            with lensu_tempdir() as tmpdir:
+                                image_paths = _write_run_images(run["files"], Path(tmpdir))
+                                quality = analyze_calibration_quality(
+                                    image_paths,
+                                    point,
+                                    pattern_size=run["settings"]["checkerboard_pattern"],
+                                )
+                                systematic = detect_systematic_error(
+                                    point,
+                                    image_paths,
+                                    pattern_size=run["settings"]["checkerboard_pattern"],
+                                )
+                                coverage_heatmap = generate_coverage_heatmap(
+                                    image_paths,
+                                    pattern_size=run["settings"]["checkerboard_pattern"],
+                                    image_size=image_size,
+                                )
+                            st.subheader("Calibration Quality Analyzer")
+                            quality_cols = st.columns(5)
+                            quality_cols[0].metric("Overall Grade", quality["overall_grade"])
+                            quality_cols[1].metric("Coverage", f"{quality['coverage_score']:.2f}")
+                            quality_cols[2].metric("Angle Diversity", f"{quality['angle_diversity']:.2f}")
+                            quality_cols[3].metric("Worst Point", f"{quality['max_error_px']:.2f}px")
+                            quality_cols[4].metric("Outliers", str(len(quality["outlier_images"])))
+                            st.image(
+                                cv2.cvtColor(coverage_heatmap, cv2.COLOR_BGR2RGB),
+                                caption="Coverage Heatmap",
+                                use_container_width=True,
+                            )
+                            st.dataframe(
+                                [
+                                    {"region": region, "coverage_pct": round(value * 100.0, 2)}
+                                    for region, value in quality["coverage_quadrants"].items()
+                                ],
+                                use_container_width=True,
+                            )
+                            st.dataframe(
+                                [
+                                    {
+                                        "check": name.replace("_", " ").title(),
+                                        "detected": values["detected"],
+                                        "severity": values["severity"],
+                                        "details": values["details"],
+                                    }
+                                    for name, values in systematic.items()
+                                ],
+                                use_container_width=True,
+                            )
+                            for recommendation in quality["recommendations"]:
+                                st.caption(f"- {recommendation}")
 
             if len(profile.calibration_points) >= 2:
                 st.subheader("Zoom Interpolation")
@@ -2461,6 +2575,38 @@ def main() -> None:
                     other_profile = _load_profile_from_upload(uploaded_compare.getvalue().decode("utf-8"))
                     comparison_rows = _compare_profiles(profile, other_profile)
                     st.dataframe(comparison_rows, use_container_width=True)
+                    matching_focals = sorted(
+                        {
+                            round(point.focal_length_mm, 3) for point in profile.calibration_points
+                        }
+                        & {
+                            round(point.focal_length_mm, 3) for point in other_profile.calibration_points
+                        }
+                    )
+                    if matching_focals:
+                        compare_focal = st.selectbox(
+                            "Distortion Comparison Focal Length",
+                            matching_focals,
+                            key="profile_compare_focal",
+                        )
+                        point_a = next(
+                            point for point in profile.calibration_points if round(point.focal_length_mm, 3) == compare_focal
+                        )
+                        point_b = next(
+                            point
+                            for point in other_profile.calibration_points
+                            if round(point.focal_length_mm, 3) == compare_focal
+                        )
+                        comparison_image = compare_distortion_profiles(
+                            point_a,
+                            point_b,
+                            (max(profile.image_width, 1), max(profile.image_height, 1)),
+                        )
+                        st.image(
+                            cv2.cvtColor(comparison_image, cv2.COLOR_BGR2RGB),
+                            caption=f"Distortion comparison at {compare_focal:.1f}mm",
+                            use_container_width=True,
+                        )
                     if st.button("Generate Comparison Report", key="generate_comparison_report"):
                         with lensu_tempdir() as tmpdir:
                             report_path = generate_comparison_report(
@@ -2530,6 +2676,53 @@ def main() -> None:
                 st.rerun()
             except Exception as exc:
                 st.error(f"Could not save the current profile. {_safe_user_message(exc, 'Library save failed.')}")
+
+        st.subheader("Profile Merge")
+        merge_selection = st.multiselect(
+            "Select library profiles to merge",
+            [row["filename"] for row in library_rows],
+            format_func=lambda filename: next(
+                (
+                    f"{row['name']} | {row['filename']} | RMS avg {row['rms_avg']:.4f}"
+                    for row in library_rows
+                    if row["filename"] == filename
+                ),
+                filename,
+            ),
+            key="library_merge_selection",
+        )
+        merge_strategy = st.selectbox(
+            "Merge Strategy",
+            ["best_rms", "average", "latest"],
+            help="`latest` uses the order selected here after library sort, so later files are treated as newer.",
+            key="library_merge_strategy",
+        )
+        merge_cols = st.columns(2)
+        with merge_cols[0]:
+            if st.button("Merge Into Session", key="library_merge_session", disabled=len(merge_selection) < 2):
+                try:
+                    merged_profile = merge_profiles([load_from_library(name) for name in merge_selection], merge_strategy)
+                    rig.cameras[st.session_state.selected_camera_label] = merged_profile
+                    st.session_state.profile = merged_profile
+                    _save_profile(merged_profile)
+                    _save_rig(rig)
+                    st.success(
+                        f"Merged {len(merge_selection)} profiles into the active session with {len(merged_profile.calibration_points)} calibration points."
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not merge the selected profiles. {_safe_user_message(exc, 'Merge failed.')}")
+        with merge_cols[1]:
+            if st.button("Merge And Save To Library", key="library_merge_save", disabled=len(merge_selection) < 2):
+                try:
+                    merged_profile = merge_profiles([load_from_library(name) for name in merge_selection], merge_strategy)
+                    saved_path = save_to_library(merged_profile)
+                    st.success(f"Merged profile saved as {saved_path.name}")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(
+                        f"Could not merge and save the selected profiles. {_safe_user_message(exc, 'Merge save failed.')}"
+                    )
 
         if not library_rows:
             st.caption("No profiles found in library with current filters.")

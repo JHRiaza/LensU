@@ -260,6 +260,151 @@ def camera_rig_from_dict(data: dict) -> CameraRig:
     return rig
 
 
+def _group_by_focal(items: list, focal_getter) -> dict[float, list]:
+    grouped: dict[float, list] = {}
+    for item in items:
+        key = round(float(focal_getter(item)), 3)
+        grouped.setdefault(key, []).append(item)
+    return grouped
+
+
+def _average_calibration_points(points: list[CalibrationPoint]) -> CalibrationPoint:
+    if not points:
+        raise ValueError("Cannot average an empty calibration point list.")
+    template = points[-1]
+    fisheye_len = max((len(point.fisheye_coeffs) for point in points), default=0)
+    averaged_fisheye = [
+        float(np.mean([point.fisheye_coeffs[index] if index < len(point.fisheye_coeffs) else 0.0 for point in points]))
+        for index in range(fisheye_len)
+    ]
+    return CalibrationPoint(
+        focal_length_mm=float(np.mean([point.focal_length_mm for point in points])),
+        k1=float(np.mean([point.k1 for point in points])),
+        k2=float(np.mean([point.k2 for point in points])),
+        p1=float(np.mean([point.p1 for point in points])),
+        p2=float(np.mean([point.p2 for point in points])),
+        k3=float(np.mean([point.k3 for point in points])),
+        cx=float(np.mean([point.cx for point in points])),
+        cy=float(np.mean([point.cy for point in points])),
+        fx=float(np.mean([point.fx for point in points])),
+        fy=float(np.mean([point.fy for point in points])),
+        rms_error=float(np.mean([point.rms_error for point in points])),
+        num_images=int(sum(point.num_images for point in points)),
+        detection_mode=template.detection_mode,
+        is_fisheye=all(point.is_fisheye for point in points),
+        fisheye_coeffs=averaged_fisheye,
+        anamorphic_desqueezed=template.anamorphic_desqueezed,
+        anamorphic_squeezed=template.anamorphic_squeezed,
+    )
+
+
+def _merge_encoder_mappings(profiles: list[LensProfile]) -> dict[str, list[dict[str, float]]]:
+    merged: dict[str, list[dict[str, float]]] = {}
+    for profile in profiles:
+        for axis, samples in profile.encoder_mappings.items():
+            if axis not in merged:
+                merged[axis] = []
+            for sample in samples:
+                if sample not in merged[axis]:
+                    merged[axis].append(sample)
+    return merged
+
+
+def merge_profiles(
+    profiles: list[LensProfile],
+    strategy: str = "best_rms",
+) -> LensProfile:
+    """Merge multiple profiles for the same lens.
+
+    `latest` uses the order of the provided `profiles` list, with later entries
+    treated as newer than earlier ones.
+    """
+
+    if not profiles:
+        raise ValueError("At least one profile is required to merge.")
+    if strategy not in {"best_rms", "average", "latest"}:
+        raise ValueError(f"Unsupported merge strategy: {strategy}")
+
+    latest_profile = profiles[-1]
+    merged = LensProfile(
+        lens_name=latest_profile.lens_name or profiles[0].lens_name,
+        lens_family=latest_profile.lens_family or profiles[0].lens_family,
+        lens_type=latest_profile.lens_type or profiles[0].lens_type,
+        sensor_width_mm=latest_profile.sensor_width_mm or profiles[0].sensor_width_mm,
+        sensor_height_mm=latest_profile.sensor_height_mm or profiles[0].sensor_height_mm,
+        image_width=latest_profile.image_width or profiles[0].image_width,
+        image_height=latest_profile.image_height or profiles[0].image_height,
+        anamorphic=latest_profile.anamorphic or profiles[0].anamorphic,
+        notes="\n".join(filter(None, [profile.notes for profile in profiles])),
+        source=f"Merged {len(profiles)} profiles ({strategy})",
+        encoder_mappings=_merge_encoder_mappings(profiles),
+    )
+
+    point_groups = _group_by_focal(
+        [point for profile in profiles for point in profile.calibration_points],
+        lambda item: item.focal_length_mm,
+    )
+    for focal in sorted(point_groups):
+        candidates = point_groups[focal]
+        if strategy == "average":
+            merged.add_calibration(_average_calibration_points(candidates))
+        elif strategy == "latest":
+            merged.add_calibration(candidates[-1])
+        else:
+            merged.add_calibration(min(candidates, key=lambda point: (point.rms_error, -point.num_images)))
+
+    offset_groups = _group_by_focal(
+        [offset for profile in profiles for offset in profile.nodal_offsets],
+        lambda item: item.focal_length_mm,
+    )
+    for focal in sorted(offset_groups):
+        candidates = offset_groups[focal]
+        if strategy == "average":
+            merged.add_nodal_offset(
+                NodalOffset(
+                    focal_length_mm=float(np.mean([offset.focal_length_mm for offset in candidates])),
+                    offset_x=float(np.mean([offset.offset_x for offset in candidates])),
+                    offset_y=float(np.mean([offset.offset_y for offset in candidates])),
+                    offset_z=float(np.mean([offset.offset_z for offset in candidates])),
+                    rotation_x=float(np.mean([offset.rotation_x for offset in candidates])),
+                    rotation_y=float(np.mean([offset.rotation_y for offset in candidates])),
+                    rotation_z=float(np.mean([offset.rotation_z for offset in candidates])),
+                    confidence=float(np.mean([offset.confidence for offset in candidates])),
+                    method=candidates[-1].method,
+                )
+            )
+        else:
+            merged.add_nodal_offset(candidates[-1])
+
+    breathing_groups = _group_by_focal(
+        [breathing for profile in profiles for breathing in profile.breathing_profiles],
+        lambda item: item.nominal_focal_length_mm,
+    )
+    for focal in sorted(breathing_groups):
+        merged_profile = BreathingProfile(nominal_focal_length_mm=focal)
+        distance_groups = _group_by_focal(
+            [point for breathing in breathing_groups[focal] for point in breathing.points],
+            lambda item: item.focus_distance_m,
+        )
+        for distance in sorted(distance_groups):
+            candidates = distance_groups[distance]
+            if strategy == "average":
+                merged_profile.points.append(
+                    BreathingPoint(
+                        focus_distance_m=float(np.mean([point.focus_distance_m for point in candidates])),
+                        measured_focal_length_mm=float(np.mean([point.measured_focal_length_mm for point in candidates])),
+                        nominal_focal_length_mm=float(
+                            np.mean([point.nominal_focal_length_mm for point in candidates])
+                        ),
+                    )
+                )
+            else:
+                merged_profile.points.append(candidates[-1])
+        merged.breathing_profiles.append(merged_profile)
+    merged.breathing_profiles.sort(key=lambda item: item.nominal_focal_length_mm)
+    return merged
+
+
 def aruco_available() -> bool:
     return hasattr(cv2, "aruco")
 
