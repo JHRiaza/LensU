@@ -1,139 +1,89 @@
-# AGENTS.md — LensU Sprint 11: Calibration Quality Analyzer + Distortion Heatmap + Profile Merge
+# AGENTS.md — LensU Sprint 12: Lens Database Community Format + OCIO Integration
 
 ## Goal
-Add advanced analysis tools that make LensU the most technically capable free lens calibration tool available.
+Add an open lens database JSON format for community sharing, and OpenColorIO (OCIO) metadata for color pipeline integration.
 
 ## Tasks
 
-### 1. Calibration Quality Analyzer (NEW: src/quality_analyzer.py)
+### 1. Open Lens Database Format (NEW: src/lens_database.py)
 
-Deep analysis of calibration quality beyond simple RMS:
-
-```python
-def analyze_calibration_quality(
-    image_paths: list[Path],
-    calibration_point: CalibrationPoint,
-    pattern_size: tuple[int, int] = (9, 6),
-) -> dict:
-    """Comprehensive calibration quality analysis.
-    
-    Returns dict with:
-    - "rms_error": float (overall)
-    - "per_image_rms": list[float] (per-image errors)
-    - "max_error_px": float (worst single point error)
-    - "coverage_score": float (0-1, how well images cover the sensor)
-    - "coverage_quadrants": dict (NW/NE/SW/SE/Center coverage %)
-    - "angle_diversity": float (0-1, variety of board orientations)
-    - "outlier_images": list[int] (indices of images with >2x mean RMS)
-    - "overall_grade": str ("VP-Ready" / "Good" / "Acceptable" / "Poor")
-    - "recommendations": list[str] (actionable improvement tips)
-    """
-
-def generate_coverage_heatmap(
-    image_paths: list[Path],
-    pattern_size: tuple[int, int],
-    image_size: tuple[int, int],
-) -> np.ndarray:
-    """Generate a heatmap image showing where checkerboard corners were detected.
-    
-    Returns a color-mapped image (hot = high coverage, cold = low).
-    """
-
-def detect_systematic_error(
-    calibration_point: CalibrationPoint,
-    image_paths: list[Path],
-    pattern_size: tuple[int, int],
-) -> dict:
-    """Detect systematic errors in calibration.
-    
-    Checks for:
-    - Tilted sensor (asymmetric image center)
-    - Decentered lens element (asymmetric distortion)
-    - Focus error (high tangential distortion)
-    - Sample bias (all images from similar angles)
-    """
-```
-
-### 2. Interactive Distortion Visualization (NEW: src/distortion_viz.py)
-
-Generate publication-quality distortion visualizations:
+Create a standardized JSON format for sharing lens calibration data:
 
 ```python
-def render_distortion_grid(
-    point: CalibrationPoint,
-    image_size: tuple[int, int],
-    grid_density: int = 20,
-    scale_factor: float = 1.0,
-) -> np.ndarray:
-    """Render a distortion grid showing how straight lines bend.
-    Blue = undistorted grid, Red = distorted grid overlay.
+def export_open_format(profile: LensProfile, output_path: Path) -> Path:
+    """Export profile in LensU Open Database Format (.lensu.json).
+    
+    Format designed for community sharing:
+    {
+      "format": "lensu-open-v1",
+      "lens": {
+        "name": "...",
+        "manufacturer": "...",
+        "type": "prime|zoom|anamorphic",
+        "mount": "PL|EF|E|LPL|...",
+        "serial": "optional"
+      },
+      "sensor": {"width_mm": 36, "height_mm": 24, "resolution": [1920, 1080]},
+      "calibrations": [...],
+      "nodal_offsets": [...],
+      "breathing": [...],
+      "metadata": {
+        "calibrated_by": "...",
+        "date": "ISO8601",
+        "tool": "LensU v1.8",
+        "notes": "..."
+      }
+    }
     """
 
-def render_distortion_magnitude_map(
-    point: CalibrationPoint,
-    image_size: tuple[int, int],
-) -> np.ndarray:
-    """Render a color-coded map showing distortion magnitude across the image.
-    Center = low distortion (blue), edges = high distortion (red).
-    Values in pixel displacement.
-    """
+def import_open_format(path: Path) -> LensProfile:
+    """Import a .lensu.json file."""
 
-def render_distortion_vector_field(
-    point: CalibrationPoint,
-    image_size: tuple[int, int],
-    arrow_density: int = 15,
-) -> np.ndarray:
-    """Render arrows showing distortion direction and magnitude at each point."""
-
-def compare_distortion_profiles(
-    point_a: CalibrationPoint,
-    point_b: CalibrationPoint,
-    image_size: tuple[int, int],
-) -> np.ndarray:
-    """Render side-by-side distortion comparison of two calibration points."""
+def validate_open_format(path: Path) -> tuple[bool, list[str]]:
+    """Validate a .lensu.json file against the schema. Returns (valid, errors)."""
 ```
 
-Add these visualizations to the Profile tab in Streamlit.
+Add lens mount type to LensProfile (PL, EF, E, LPL, etc).
+Add manufacturer field.
 
-### 3. Profile Merge Tool (calibration.py)
+### 2. Lens Database Browser (app.py)
 
-Merge calibration data from multiple sessions:
+Add a "Community" tab:
+- Browse preset profiles
+- Import .lensu.json files
+- Export current profile as .lensu.json
+- Validation check on import
 
+### 3. Color Pipeline Metadata
+
+Add OCIO-relevant metadata to exports:
+- Sensor color science (ARRI LogC, RED IPP2, Sony S-Log3, Canon Log, etc.)
+- Working color space
+- Store in profile and include in UE/Nuke exports
+
+Add to LensProfile:
 ```python
-def merge_profiles(
-    profiles: list[LensProfile],
-    strategy: str = "best_rms",  # "best_rms", "average", "latest"
-) -> LensProfile:
-    """Merge multiple profiles for the same lens.
-    
-    Strategies:
-    - "best_rms": For each focal length, keep the calibration with lowest RMS
-    - "average": Average the distortion coefficients across profiles  
-    - "latest": Keep the most recent calibration for each focal length
-    
-    Use case: calibrate the same lens multiple times over weeks/months,
-    merge the best results into a single authoritative profile.
-    """
+color_science: str = ""  # e.g., "ARRI LogC4", "Sony S-Log3/S-Gamut3.Cine"
+working_colorspace: str = ""  # e.g., "ACEScg", "Linear sRGB"
 ```
 
-Add merge UI in the Lens Library tab.
+### 4. Final integration test
 
-### 4. Update Tests
-
-Add tests for quality analyzer, distortion visualization, and profile merge.
+Create `src/tests/test_integration.py`:
+- Full workflow test: create profile -> add calibration -> add nodal -> export UE -> export Nuke -> export open format -> import back -> validate match
+- Ensure roundtrip data integrity
 
 ## Quality Requirements
-- Heatmap must be visually clear and informative
-- Quality analyzer recommendations must be actionable
-- Profile merge must not lose data
-- All existing tests pass + new tests
+- Open format must be self-documenting (clear field names, includes format version)
+- Validation must catch common errors (missing fields, out-of-range values)
+- All 31+ tests must pass + new tests
 
 ## Test Plan
 1. All imports succeed
 2. All tests pass
-3. Quality analyzer returns valid dict for dummy data
-4. Distortion grid renders to valid image array
-5. Profile merge produces valid merged profile
+3. Open format roundtrip: export -> import -> compare = identical
+4. Integration test passes
+5. App launches with Community tab
 
 When completely finished, run:
-openclaw system event --text "Done: LensU Sprint 11 -- Quality analyzer, distortion viz, profile merge" --mode now
+openclaw system event --text "Done: LensU Sprint 12 -- Open format, OCIO metadata, integration tests" --mode now
