@@ -1,160 +1,139 @@
-# AGENTS.md — LensU Sprint 10: Comprehensive Documentation + Examples
+# AGENTS.md — LensU Sprint 11: Calibration Quality Analyzer + Distortion Heatmap + Profile Merge
 
 ## Goal
-Create thorough documentation and example workflows so users can get started immediately. This is the "release readiness" sprint.
+Add advanced analysis tools that make LensU the most technically capable free lens calibration tool available.
 
 ## Tasks
 
-### 1. Documentation (NEW: docs/ directory)
+### 1. Calibration Quality Analyzer (NEW: src/quality_analyzer.py)
 
-Create `docs/` with markdown files:
+Deep analysis of calibration quality beyond simple RMS:
 
-**docs/getting-started.md:**
-- Installation (pip install, git clone, requirements)
-- First calibration walkthrough (print board, take photos, upload, calibrate, export)
-- Quick start with presets
-- System requirements
-
-**docs/calibration-guide.md:**
-- Choosing checkerboard vs ChArUco
-- Optimal number of images (15-30)
-- Image coverage patterns (show diagram as ASCII art)
-- Lighting requirements
-- Common mistakes and how to avoid them
-- Accuracy targets for VP (<0.3px RMS)
-- Zoom lens calibration strategy
-
-**docs/ue-integration.md:**
-- Step-by-step UE import guide
-- Camera Calibration plugin setup
-- Assigning LensFile to CineCamera
-- LiveLink streaming setup
-- Troubleshooting common UE issues
-
-**docs/nuke-integration.md:**
-- Importing LensU .nk scripts
-- Using the gizmo
-- STMap workflow in Nuke
-- Matching UE and Nuke distortion
-
-**docs/api-reference.md:**
-- REST API endpoints with curl examples
-- Python API reference (key classes and methods)
-- CLI command reference with examples
-
-**docs/advanced.md:**
-- Anamorphic lens calibration
-- Fisheye/ultra-wide calibration
-- Lens breathing measurement
-- Nodal offset estimation
-- FreeD/OpenTrackIO integration
-- Multi-camera rigs
-- Encoder mapping
-- Batch calibration from video
-
-### 2. Example Workflows (NEW: examples/ directory)
-
-**examples/basic_calibration.py:**
 ```python
-"""Example: Calibrate a 50mm prime lens from images."""
-from src.calibration import calibrate_from_images, LensProfile
-from src.ue_export import export_ue_json, export_ue_python_script
-from pathlib import Path
+def analyze_calibration_quality(
+    image_paths: list[Path],
+    calibration_point: CalibrationPoint,
+    pattern_size: tuple[int, int] = (9, 6),
+) -> dict:
+    """Comprehensive calibration quality analysis.
+    
+    Returns dict with:
+    - "rms_error": float (overall)
+    - "per_image_rms": list[float] (per-image errors)
+    - "max_error_px": float (worst single point error)
+    - "coverage_score": float (0-1, how well images cover the sensor)
+    - "coverage_quadrants": dict (NW/NE/SW/SE/Center coverage %)
+    - "angle_diversity": float (0-1, variety of board orientations)
+    - "outlier_images": list[int] (indices of images with >2x mean RMS)
+    - "overall_grade": str ("VP-Ready" / "Good" / "Acceptable" / "Poor")
+    - "recommendations": list[str] (actionable improvement tips)
+    """
 
-# 1. Calibrate
-images = list(Path("./my_photos").glob("*.jpg"))
-point, used = calibrate_from_images(images, focal_length_mm=50)
+def generate_coverage_heatmap(
+    image_paths: list[Path],
+    pattern_size: tuple[int, int],
+    image_size: tuple[int, int],
+) -> np.ndarray:
+    """Generate a heatmap image showing where checkerboard corners were detected.
+    
+    Returns a color-mapped image (hot = high coverage, cold = low).
+    """
 
-# 2. Build profile
-profile = LensProfile(lens_name="Cooke S4/i 50mm", sensor_width_mm=24.89, sensor_height_mm=18.66)
-profile.add_calibration(point)
-
-# 3. Export for UE
-export_ue_json(profile, Path("./output"))
-export_ue_python_script(profile, "calibration.json", Path("./output"))
+def detect_systematic_error(
+    calibration_point: CalibrationPoint,
+    image_paths: list[Path],
+    pattern_size: tuple[int, int],
+) -> dict:
+    """Detect systematic errors in calibration.
+    
+    Checks for:
+    - Tilted sensor (asymmetric image center)
+    - Decentered lens element (asymmetric distortion)
+    - Focus error (high tangential distortion)
+    - Sample bias (all images from similar angles)
+    """
 ```
 
-**examples/zoom_lens_batch.py:**
+### 2. Interactive Distortion Visualization (NEW: src/distortion_viz.py)
+
+Generate publication-quality distortion visualizations:
+
 ```python
-"""Example: Batch calibrate a zoom lens from organized folders."""
-from src.batch import batch_calibrate
-# Folder structure: ./shots/24mm/, ./shots/35mm/, ./shots/50mm/, ./shots/70mm/
-profile = batch_calibrate(Path("./shots"), sensor_width_mm=24.89, sensor_height_mm=18.66)
-profile.lens_name = "Angenieux EZ-1 30-90mm"
-profile.save_json(Path("./angenieux_ez1.json"))
+def render_distortion_grid(
+    point: CalibrationPoint,
+    image_size: tuple[int, int],
+    grid_density: int = 20,
+    scale_factor: float = 1.0,
+) -> np.ndarray:
+    """Render a distortion grid showing how straight lines bend.
+    Blue = undistorted grid, Red = distorted grid overlay.
+    """
+
+def render_distortion_magnitude_map(
+    point: CalibrationPoint,
+    image_size: tuple[int, int],
+) -> np.ndarray:
+    """Render a color-coded map showing distortion magnitude across the image.
+    Center = low distortion (blue), edges = high distortion (red).
+    Values in pixel displacement.
+    """
+
+def render_distortion_vector_field(
+    point: CalibrationPoint,
+    image_size: tuple[int, int],
+    arrow_density: int = 15,
+) -> np.ndarray:
+    """Render arrows showing distortion direction and magnitude at each point."""
+
+def compare_distortion_profiles(
+    point_a: CalibrationPoint,
+    point_b: CalibrationPoint,
+    image_size: tuple[int, int],
+) -> np.ndarray:
+    """Render side-by-side distortion comparison of two calibration points."""
 ```
 
-**examples/livelink_stream.py:**
+Add these visualizations to the Profile tab in Streamlit.
+
+### 3. Profile Merge Tool (calibration.py)
+
+Merge calibration data from multiple sessions:
+
 ```python
-"""Example: Stream lens data to UE via LiveLink."""
-from src.livelink_emitter import LiveLinkEmitter
-from src.calibration import LensProfile
-profile = LensProfile.load_json(Path("./my_lens.json"))
-emitter = LiveLinkEmitter(target_ip="192.168.1.100", port=11111)
-emitter.start_streaming(profile, fps=24)
+def merge_profiles(
+    profiles: list[LensProfile],
+    strategy: str = "best_rms",  # "best_rms", "average", "latest"
+) -> LensProfile:
+    """Merge multiple profiles for the same lens.
+    
+    Strategies:
+    - "best_rms": For each focal length, keep the calibration with lowest RMS
+    - "average": Average the distortion coefficients across profiles  
+    - "latest": Keep the most recent calibration for each focal length
+    
+    Use case: calibrate the same lens multiple times over weeks/months,
+    merge the best results into a single authoritative profile.
+    """
 ```
 
-**examples/api_client.py:**
-```python
-"""Example: Use LensU REST API from external tool."""
-import requests
-# Start server: lensu serve --port 8600
-r = requests.get("http://localhost:8600/api/presets")
-print(r.json())
-r = requests.post("http://localhost:8600/api/calibrate", json={...})
-```
+Add merge UI in the Lens Library tab.
 
-### 3. CHANGELOG.md
+### 4. Update Tests
 
-Create a changelog documenting all versions:
-```
-# Changelog
-
-## v1.7.0 (2026-03-15)
-- LiveLink UDP emitter for streaming to UE
-- Step-by-step calibration wizard
-- Dark theme UI
-- Session auto-save and recovery
-
-## v1.6.0 (2026-03-15)
-- REST API server (lensu serve)
-- Multi-camera rig support
-- Nuke export (.nk scripts and .gizmo)
-
-## v1.5.0 (2026-03-15)
-- Fisheye/ultra-wide lens calibration
-- FIZ encoder mapping tables
-- pip-installable package (pyproject.toml)
-- Clean project structure
-
-... (continue for all versions back to v1.0)
-```
-
-### 4. LICENSE
-
-Verify MIT LICENSE file exists and is correct. If missing, create it.
-
-### 5. Contributing Guide
-
-Create `CONTRIBUTING.md`:
-- How to set up dev environment
-- Running tests
-- Code style (type hints, docstrings)
-- How to add new preset lenses
-- How to add new export formats
+Add tests for quality analyzer, distortion visualization, and profile merge.
 
 ## Quality Requirements
-- All documentation must be accurate and match current code
-- Examples must be runnable (correct imports, realistic parameters)
-- No broken internal links
-- Documentation should be beginner-friendly
-- All existing tests must still pass
+- Heatmap must be visually clear and informative
+- Quality analyzer recommendations must be actionable
+- Profile merge must not lose data
+- All existing tests pass + new tests
 
 ## Test Plan
-1. All 25+ tests still pass
-2. All example scripts parse without syntax errors: `python -c "import ast; ast.parse(open('examples/basic_calibration.py').read())"`
-3. Documentation files exist and are non-empty
-4. App still launches correctly
+1. All imports succeed
+2. All tests pass
+3. Quality analyzer returns valid dict for dummy data
+4. Distortion grid renders to valid image array
+5. Profile merge produces valid merged profile
 
 When completely finished, run:
-openclaw system event --text "Done: LensU Sprint 10 -- Docs, examples, changelog" --mode now
+openclaw system event --text "Done: LensU Sprint 11 -- Quality analyzer, distortion viz, profile merge" --mode now
