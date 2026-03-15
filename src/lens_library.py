@@ -14,7 +14,21 @@ except ImportError:
     from calibration import LensProfile, lens_profile_from_dict
 
 
-LIBRARY_DIR = Path.home() / ".lensu" / "library"
+def _library_dir() -> Path:
+    preferred = Path.home() / ".lensu" / "library"
+    try:
+        preferred.mkdir(parents=True, exist_ok=True)
+        probe = preferred / ".write_test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return preferred
+    except OSError:
+        fallback = Path.cwd() / ".tmp_test" / "lensu_state" / "library"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
+LIBRARY_DIR = _library_dir()
 
 if __name__ == "lens_library":
     sys.modules.setdefault("src.lens_library", sys.modules[__name__])

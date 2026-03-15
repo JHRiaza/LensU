@@ -1,12 +1,13 @@
 # LensU
 
-Free cinema lens calibration for Unreal Engine
+Cinema lens calibration for Unreal Engine, Nuke, and virtual production workflows.
 
-## What it does
+## What LensU Does
 
-- Calibrates spherical and anamorphic cinema lenses from checkerboard or ChArUco captures
-- Exports Unreal Engine LensFile-ready JSON, Python import scripts, and optional STMaps
-- Integrates lens distortion, nodal offset, breathing, batch workflows, and comparison reporting in one tool
+- Calibrates spherical, zoom, anamorphic, and fisheye lenses from checkerboard or ChArUco captures
+- Exports Unreal Engine LensFile-ready JSON, Python import scripts, STMaps, and Nuke packages
+- Streams lens data directly to Unreal over UDP with a LiveLink-compatible JSON emitter
+- Includes a guided beginner wizard, live tracking ingest, nodal offsets, breathing, reports, and a local profile library
 
 ## Quick Start
 
@@ -23,60 +24,65 @@ python -m src.cli batch --dir ./zoom_calibration --mode checkerboard --sensor fu
 python -m src.cli export --profile ./Cooke_50mm_profile.json --output ./ue_export --include-stmaps
 python -m src.cli board --type checkerboard --pattern 9x6 --square-size 25 --output ./checkerboard.pdf
 python -m src.cli library --list
+python -m src.cli serve --host 127.0.0.1 --port 8600
 ```
 
-## Features
+## Feature List
 
-- [x] Checkerboard calibration
-- [x] ChArUco calibration
-- [x] Anamorphic lens support with squeezed and desqueezed parameter views
-- [x] Live camera calibration workflow
-- [x] Video frame extraction and calibration
-- [x] Batch calibration by focal-length folders
-- [x] Lens breathing capture and export
-- [x] Nodal offset storage and parallax estimation
-- [x] Unreal Engine parameter export
-- [x] STMap export
-- [x] Professional PDF calibration reports
-- [x] PDF comparison reports for QC and drift checks
-- [x] Local lens profile library
-- [x] Printable checkerboard and ChArUco boards
+- Calibration wizard for first-time users
+- Checkerboard calibration
+- ChArUco calibration
+- Anamorphic calibration with squeezed and desqueezed reporting
+- Fisheye calibration
+- Live camera calibration workflow
+- Video frame extraction and calibration
+- Batch calibration by focal-length folders
+- Lens breathing capture and export
+- Nodal offset storage and parallax estimation
+- Live Tracking ingest for FreeD and OpenTrackIO
+- LiveLink-compatible UDP streaming for Unreal Engine
+- Unreal Engine parameter export
+- STMap export
+- Nuke script and gizmo export
+- REST API via `lensu serve`
+- Multi-camera rig support
+- Professional PDF calibration reports
+- Profile comparison reports for QC and drift checks
+- Local lens profile library
+- Printable checkerboard and ChArUco boards
+- Session autosave and restore
 
 ## Supported Lens Types
 
 - Spherical primes
 - Spherical zooms
 - Anamorphic lenses
+- Fisheye and ultra-wide lenses
 
-## UE Compatibility
+## Unreal Engine Workflow
 
-- Unreal Engine 5.4
-- Unreal Engine 5.5
-- Unreal Engine 5.6
-- Unreal Engine 5.7+
+LensU supports:
 
-## Comparison with Kalibrate
+- Unreal Engine LensFile JSON export
+- Unreal Python import script generation
+- STMap package generation
+- LiveLink-style UDP streaming
+- Multi-camera export packaging
 
-| Capability | LensU | Kalibrate |
-| --- | --- | --- |
-| Cost | Free | Commercial |
-| Unreal Engine export | Yes | Yes |
-| STMap export | Yes | Yes |
-| Checkerboard calibration | Yes | Yes |
-| ChArUco calibration | Yes | Varies by workflow |
-| Anamorphic calibration | Yes | Commercial workflow |
-| Comparison reports | Yes | Typically external |
-| Local profile library | Yes | Varies |
-| Source availability | Open Python project | Proprietary |
+## REST API
 
-## Screenshots
+Start the local API server:
 
-Place release screenshots here:
+```bash
+python -m src.cli serve --host 127.0.0.1 --port 8600
+```
 
-- Main calibration workflow
-- Anamorphic parameter view
-- UE export tab
-- PDF report samples
+Available endpoints include:
+
+- `/api/status`
+- `/api/library`
+- `/api/library/<filename>`
+- `/api/export`
 
 ## Requirements
 

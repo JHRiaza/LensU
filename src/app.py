@@ -56,15 +56,18 @@ try:
         save_to_library,
         search_library,
     )
+    from .livelink_emitter import LiveLinkEmitter
     from .live_calibration import live_calibration_ui
     from .nuke_export import export_nuke_gizmo, export_nuke_script
     from .presets import list_presets, load_preset
     from .protocols.freed import FreeDPacket, freed_to_fiz, start_freed_listener
     from .protocols.opentrackio import OpenTrackIOSample, map_opentrackio_fiz, start_opentrackio_listener
     from .report import generate_calibration_report, generate_comparison_report
+    from .session_autosave import autosave_exists, load_autosave, write_autosave
     from .temp_paths import lensu_tempdir
     from .ue_export import export_ue_json, export_ue_multi_camera_package, export_ue_python_script
     from .video_extractor import extract_frames_from_video, extract_frames_with_checkerboard
+    from .wizard import calibration_wizard_ui
 except ImportError:
     from board_generator import generate_charuco_pdf, generate_checkerboard_pdf
     from batch import BatchFolderResult, batch_calibrate_detailed
@@ -102,22 +105,45 @@ except ImportError:
         save_to_library,
         search_library,
     )
+    from livelink_emitter import LiveLinkEmitter
     from live_calibration import live_calibration_ui
     from nuke_export import export_nuke_gizmo, export_nuke_script
     from presets import list_presets, load_preset
     from protocols.freed import FreeDPacket, freed_to_fiz, start_freed_listener
     from protocols.opentrackio import OpenTrackIOSample, map_opentrackio_fiz, start_opentrackio_listener
     from report import generate_calibration_report, generate_comparison_report
+    from session_autosave import autosave_exists, load_autosave, write_autosave
     from temp_paths import lensu_tempdir
     from ue_export import export_ue_json, export_ue_multi_camera_package, export_ue_python_script
     from video_extractor import extract_frames_from_video, extract_frames_with_checkerboard
+    from wizard import calibration_wizard_ui
 
 
-APP_VERSION = f"v{__version__}" if "__version__" in globals() else "v1.5.0"
-PROFILE_STATE_PATH = Path.home() / ".lensu" / "current_profile.json"
-RIG_STATE_PATH = Path.home() / ".lensu" / "current_rig.json"
+APP_VERSION = f"v{__version__}" if "__version__" in globals() else "v1.6.0"
 
-st.set_page_config(page_title="LensU", page_icon="L", layout="wide")
+
+def _state_dir() -> Path:
+    preferred = Path.home() / ".lensu"
+    try:
+        preferred.mkdir(parents=True, exist_ok=True)
+        probe = preferred / ".write_test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return preferred
+    except OSError:
+        fallback = Path.cwd() / ".tmp_test" / "lensu_state"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
+PROFILE_STATE_PATH = _state_dir() / "current_profile.json"
+RIG_STATE_PATH = _state_dir() / "current_rig.json"
+
+st.set_page_config(
+    page_title="LensU | Virtual Production Lens Calibration",
+    page_icon=":movie_camera:",
+    layout="wide",
+)
 
 
 class MemoryUpload:
@@ -218,10 +244,79 @@ if "tracking_state" not in st.session_state:
         "recording": False,
         "error": "",
     }
+if "livelink_state" not in st.session_state:
+    st.session_state.livelink_state = {
+        "target_ip": "127.0.0.1",
+        "port": 11111,
+        "fps": 24,
+        "mode": "Static Profile",
+        "emitter": None,
+        "enabled": False,
+        "frame": 0,
+        "static_focal_length": 50.0,
+        "last_error": "",
+    }
+if "autosave_offer_pending" not in st.session_state:
+    st.session_state.autosave_offer_pending = autosave_exists()
 
 
 def _tracking_state() -> dict[str, Any]:
     return st.session_state.tracking_state
+
+
+def _livelink_state() -> dict[str, Any]:
+    return st.session_state.livelink_state
+
+
+def _safe_user_message(exc: Exception, fallback: str) -> str:
+    text = str(exc).strip()
+    return text or fallback
+
+
+def _apply_autosave_restore() -> bool:
+    payload = load_autosave()
+    if not payload:
+        st.session_state.autosave_offer_pending = False
+        return False
+    st.session_state.camera_rig = payload["rig"]
+    labels = list(st.session_state.camera_rig.cameras) or ["Camera A"]
+    if not st.session_state.camera_rig.cameras:
+        st.session_state.camera_rig.add_camera(labels[0], LensProfile())
+    selected = payload["selected_camera_label"]
+    st.session_state.selected_camera_label = selected if selected in st.session_state.camera_rig.cameras else labels[0]
+    st.session_state.profile = st.session_state.camera_rig.cameras[st.session_state.selected_camera_label]
+    st.session_state.calibration_runs = payload.get("calibration_runs", {}) or {}
+    st.session_state.autosave_offer_pending = False
+    return True
+
+
+def _persist_session_state(rig: CameraRig) -> None:
+    _save_profile(_active_profile())
+    _save_rig(rig)
+    try:
+        write_autosave(
+            rig=rig,
+            selected_camera_label=st.session_state.selected_camera_label,
+            calibration_runs=st.session_state.calibration_runs,
+        )
+    except OSError:
+        return
+
+
+def _render_autosave_prompt() -> None:
+    if not st.session_state.get("autosave_offer_pending"):
+        return
+    st.info("An autosaved LensU session was found. Restore it before continuing if you want the latest unsaved work.")
+    cols = st.columns(2)
+    with cols[0]:
+        if st.button("Restore Autosave", key="restore_autosave"):
+            if _apply_autosave_restore():
+                st.rerun()
+            st.warning("Autosave data could not be restored.")
+    with cols[1]:
+        if st.button("Dismiss Autosave", key="dismiss_autosave"):
+            st.session_state.autosave_offer_pending = False
+            st.rerun()
 
 
 def _stop_tracking_listener() -> None:
@@ -258,6 +353,28 @@ def _start_tracking_listener(protocol: str, address: str, port: int) -> None:
     state["socket"] = sock
     state["latest"] = None
     state["error"] = ""
+
+
+def _stop_livelink_stream() -> None:
+    state = _livelink_state()
+    emitter = state.get("emitter")
+    if emitter is not None:
+        emitter.close()
+    state["emitter"] = None
+    state["enabled"] = False
+
+
+def _start_livelink_stream(target_ip: str, port: int, fps: int, profile: LensProfile) -> None:
+    state = _livelink_state()
+    _stop_livelink_stream()
+    emitter = LiveLinkEmitter(target_ip=target_ip, port=int(port))
+    emitter.start_streaming(profile, fps=max(int(fps), 1))
+    state["target_ip"] = target_ip
+    state["port"] = int(port)
+    state["fps"] = max(int(fps), 1)
+    state["emitter"] = emitter
+    state["enabled"] = True
+    state["last_error"] = ""
 
 
 def _tracking_row_from_freed(packet: FreeDPacket, profile: LensProfile) -> dict[str, Any]:
@@ -302,6 +419,7 @@ def _tracking_row_from_opentrackio(sample: OpenTrackIOSample, profile: LensProfi
 
 def _drain_tracking_queue(profile: LensProfile) -> None:
     state = _tracking_state()
+    livelink = _livelink_state()
     callback_queue: queue.Queue[Any] = state["queue"]
     while True:
         try:
@@ -317,6 +435,14 @@ def _drain_tracking_queue(profile: LensProfile) -> None:
             continue
 
         state["latest"] = row
+        emitter = livelink.get("emitter")
+        if livelink.get("enabled") and livelink.get("mode") == "Forward FIZ" and emitter is not None:
+            try:
+                emitter.send_fiz_update(row["focus_m"], row["iris"], row["zoom_mm"], profile)
+                livelink["frame"] = emitter.frame
+            except OSError as exc:
+                livelink["last_error"] = _safe_user_message(exc, "LiveLink streaming error.")
+                _stop_livelink_stream()
         if state.get("recording"):
             state["rows"].append(row)
             state["rows"] = state["rows"][-5000:]
@@ -590,6 +716,16 @@ def _store_run(
     }
 
 
+def _safe_calibrate_files(**kwargs: Any) -> tuple[CalibrationPoint | None, CalibrationDiagnostics, list[dict[str, Any]]]:
+    try:
+        return _calibrate_files(**kwargs)
+    except Exception as exc:
+        diagnostics = CalibrationDiagnostics(image_size=None)
+        diagnostics.image_results = []
+        st.error(f"Calibration could not be completed. {_safe_user_message(exc, 'Please review the images and settings.')}")
+        return None, diagnostics, []
+
+
 def _render_vega_bar_chart(
     values: list[dict[str, Any]], x_field: str, y_field: str, title: str
 ) -> None:
@@ -668,7 +804,7 @@ def _render_header() -> None:
         f"""
         <div style="padding: 0.4rem 0 1rem 0;">
             <div style="font-size: 2rem; font-weight: 700; letter-spacing: 0.02em;">LensU</div>
-            <div style="color: #6b7280;">{APP_VERSION} | Free lens calibration for virtual production</div>
+            <div style="color: #9ca3af;">{APP_VERSION} | Lens calibration for virtual production</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -677,7 +813,9 @@ def _render_header() -> None:
 
 def _render_footer() -> None:
     st.divider()
-    st.caption("LensU v1.3 - Free lens calibration for virtual production")
+    st.markdown(
+        f"**{APP_VERSION}** | [Docs](https://github.com/jhriaza/lensu) | Made for Virtual Production"
+    )
 
 
 def _render_board_generator_sidebar(dictionary_names: dict[str, int]) -> None:
@@ -873,8 +1011,8 @@ def _render_calibration_visuals(run: dict[str, Any]) -> None:
             if len(remaining) < 3:
                 st.error("Need at least 3 valid images after exclusion.")
             else:
-                point_new, diagnostics_new, files_new = _calibrate_files(
-                    [MemoryUpload(entry["name"], entry["bytes"]) for entry in remaining],
+                point_new, diagnostics_new, files_new = _safe_calibrate_files(
+                    uploaded_files=[MemoryUpload(entry["name"], entry["bytes"]) for entry in remaining],
                     focal_length=point.focal_length_mm,
                     mode=run["mode"],
                     checkerboard_pattern=settings["checkerboard_pattern"],
@@ -892,8 +1030,9 @@ def _render_calibration_visuals(run: dict[str, Any]) -> None:
                     st.error("Re-calibration failed with the remaining images.")
                 else:
                     st.session_state.profile.add_calibration(point_new)
-                    st.session_state.profile.image_width = diagnostics_new.image_size[0]
-                    st.session_state.profile.image_height = diagnostics_new.image_size[1]
+                    if diagnostics_new.image_size:
+                        st.session_state.profile.image_width = diagnostics_new.image_size[0]
+                        st.session_state.profile.image_height = diagnostics_new.image_size[1]
                     _store_run(point_new.focal_length_mm, run["mode"], point_new, diagnostics_new, files_new, settings)
                     _save_profile(st.session_state.profile)
                     st.rerun()
@@ -1191,6 +1330,7 @@ def _render_encoder_mapping_editor(profile: LensProfile) -> None:
 
 def _render_live_tracking_tab(profile: LensProfile) -> None:
     state = _tracking_state()
+    livelink = _livelink_state()
     _drain_tracking_queue(profile)
 
     st.header("Live Tracking")
@@ -1266,6 +1406,73 @@ def _render_live_tracking_tab(profile: LensProfile) -> None:
         st.caption("Current profile has no calibration points. FreeD zoom values fall back to normalized raw encoder data.")
 
     st.divider()
+    st.subheader("LiveLink")
+    ll1, ll2, ll3 = st.columns(3)
+    with ll1:
+        livelink["target_ip"] = st.text_input("Target IP", value=livelink.get("target_ip", "127.0.0.1"))
+        livelink["mode"] = st.selectbox(
+            "Stream Mode",
+            ["Static Profile", "Forward FIZ"],
+            index=0 if livelink.get("mode") == "Static Profile" else 1,
+        )
+    with ll2:
+        livelink["port"] = int(
+            st.number_input("Target Port", min_value=1, max_value=65535, value=int(livelink.get("port", 11111)), step=1)
+        )
+        livelink["fps"] = int(
+            st.number_input("LiveLink FPS", min_value=1, max_value=120, value=int(livelink.get("fps", 24)), step=1)
+        )
+    with ll3:
+        default_static = (
+            float(profile.calibration_points[0].focal_length_mm) if profile.calibration_points else float(livelink.get("static_focal_length", 50.0))
+        )
+        livelink["static_focal_length"] = float(
+            st.number_input("Static Focal (mm)", value=default_static, step=1.0, format="%.1f")
+        )
+        st.metric("Frames Sent", str(int(livelink.get("frame", 0))))
+
+    ll_actions = st.columns(2)
+    with ll_actions[0]:
+        if st.button("Start LiveLink", type="primary", use_container_width=True):
+            try:
+                _start_livelink_stream(
+                    target_ip=str(livelink["target_ip"]),
+                    port=int(livelink["port"]),
+                    fps=int(livelink["fps"]),
+                    profile=profile,
+                )
+                emitter = livelink.get("emitter")
+                if livelink.get("mode") == "Static Profile" and emitter is not None:
+                    emitter.send_static_profile(profile, float(livelink["static_focal_length"]))
+                    livelink["frame"] = emitter.frame
+                st.rerun()
+            except OSError as exc:
+                livelink["last_error"] = _safe_user_message(exc, "Could not start LiveLink streaming.")
+    with ll_actions[1]:
+        if st.button("Stop LiveLink", use_container_width=True):
+            _stop_livelink_stream()
+            st.rerun()
+
+    emitter = livelink.get("emitter")
+    if livelink.get("enabled") and emitter is not None and livelink.get("mode") == "Static Profile":
+        try:
+            emitter.send_static_profile(profile, float(livelink["static_focal_length"]))
+            livelink["frame"] = emitter.frame
+        except OSError as exc:
+            livelink["last_error"] = _safe_user_message(exc, "LiveLink send failed.")
+            _stop_livelink_stream()
+
+    st.caption(
+        f"LiveLink status: {'running' if livelink.get('enabled') else 'stopped'} | mode: {livelink.get('mode')}"
+    )
+    if livelink.get("last_error"):
+        st.error(livelink["last_error"])
+    if livelink.get("mode") == "Forward FIZ":
+        st.caption("Forward FIZ streams interpolated lens distortion using the latest FreeD or OpenTrackIO values.")
+    else:
+        st.caption("Static Profile streams the selected focal length continuously without needing live tracking input.")
+
+    st.divider()
     _render_encoder_mapping_editor(profile)
 
     rows = state.get("rows", [])
@@ -1280,7 +1487,7 @@ def _render_live_tracking_tab(profile: LensProfile) -> None:
         )
 
     auto_refresh = st.checkbox("Auto-refresh while listener is running", value=active, key="tracking_autorefresh")
-    if active and auto_refresh:
+    if (active or livelink.get("enabled")) and auto_refresh:
         time.sleep(1.0)
         st.rerun()
 
@@ -1289,6 +1496,7 @@ def main() -> None:
     rig: CameraRig = _active_rig()
     profile: LensProfile = _active_profile()
     _render_header()
+    _render_autosave_prompt()
 
     with st.sidebar:
         st.header("Lens Setup")
@@ -1520,7 +1728,20 @@ def main() -> None:
         "anamorphic_desqueezed": bool(anamorphic_desqueezed),
     }
 
+    st.session_state.wizard_context = {
+        "profile": profile,
+        "rig": rig,
+        "settings": settings,
+        "dictionary_names": dictionary_names,
+        "save_profile": _save_profile,
+        "save_rig": _save_rig,
+        "store_run": _store_run,
+        "prepare_export_bundle": _prepare_export_bundle,
+        "prepare_nuke_bundle": _prepare_nuke_bundle,
+    }
+
     (
+        tab_wizard,
         tab_calibrate,
         tab_live,
         tab_tracking,
@@ -1533,6 +1754,7 @@ def main() -> None:
         tab_export,
     ) = st.tabs(
         [
+            "Wizard",
             "Distortion Calibration",
             "Live Calibration",
             "Live Tracking",
@@ -1545,6 +1767,9 @@ def main() -> None:
             "UE Export",
         ]
     )
+
+    with tab_wizard:
+        calibration_wizard_ui()
 
     with tab_calibrate:
         st.header("Distortion Calibration")
@@ -1582,8 +1807,8 @@ def main() -> None:
 
         if uploaded_files and st.button("Run Calibration", type="primary"):
             with st.spinner("Running calibration..."):
-                point, diagnostics, files = _calibrate_files(
-                    uploaded_files,
+                point, diagnostics, files = _safe_calibrate_files(
+                    uploaded_files=uploaded_files,
                     focal_length=float(focal_length),
                     mode=detection_mode,
                     checkerboard_pattern=settings["checkerboard_pattern"],
@@ -1625,7 +1850,11 @@ def main() -> None:
             key="live_focal",
             help="Focal length represented by the live capture set.",
         )
-        live_result = live_calibration_ui(float(live_focal_length), detection_mode, settings)
+        try:
+            live_result = live_calibration_ui(float(live_focal_length), detection_mode, settings)
+        except Exception as exc:
+            live_result = None
+            st.error(f"Live calibration failed. {_safe_user_message(exc, 'Please check the camera feed and calibration settings.')}")
         if live_result:
             point = live_result["point"]
             diagnostics = live_result["diagnostics"]
@@ -1765,8 +1994,8 @@ def main() -> None:
             if st.button("Calibrate From Extracted Frames", type="primary"):
                 uploads = [MemoryUpload(entry["name"], entry["bytes"]) for entry in extracted_frames]
                 with st.spinner("Calibrating from extracted frames..."):
-                    point, diagnostics, files = _calibrate_files(
-                        uploads,
+                    point, diagnostics, files = _safe_calibrate_files(
+                        uploaded_files=uploads,
                         focal_length=float(video_focal_length),
                         mode=detection_mode,
                         checkerboard_pattern=settings["checkerboard_pattern"],
@@ -1905,8 +2134,8 @@ def main() -> None:
 
         if breathing_uploads and st.button("Measure Breathing Point", type="primary"):
             with st.spinner("Measuring effective focal length..."):
-                point, diagnostics, _ = _calibrate_files(
-                    breathing_uploads,
+                point, diagnostics, _ = _safe_calibrate_files(
+                    uploaded_files=breathing_uploads,
                     focal_length=float(breathing_nominal),
                     mode=detection_mode,
                     checkerboard_pattern=settings["checkerboard_pattern"],
@@ -2228,20 +2457,23 @@ def main() -> None:
                 help="Compare this calibration against another day or another body setup to spot drift.",
             )
             if uploaded_compare is not None:
-                other_profile = _load_profile_from_upload(uploaded_compare.getvalue().decode("utf-8"))
-                comparison_rows = _compare_profiles(profile, other_profile)
-                st.dataframe(comparison_rows, use_container_width=True)
-                if st.button("Generate Comparison Report", key="generate_comparison_report"):
-                    with lensu_tempdir() as tmpdir:
-                        report_path = generate_comparison_report(
-                            profile,
-                            other_profile,
-                            Path(tmpdir) / f"{profile.lens_name.replace(' ', '_')}_comparison_report.pdf",
-                        )
-                        st.session_state.comparison_report_download = {
-                            "name": report_path.name,
-                            "bytes": report_path.read_bytes(),
-                        }
+                try:
+                    other_profile = _load_profile_from_upload(uploaded_compare.getvalue().decode("utf-8"))
+                    comparison_rows = _compare_profiles(profile, other_profile)
+                    st.dataframe(comparison_rows, use_container_width=True)
+                    if st.button("Generate Comparison Report", key="generate_comparison_report"):
+                        with lensu_tempdir() as tmpdir:
+                            report_path = generate_comparison_report(
+                                profile,
+                                other_profile,
+                                Path(tmpdir) / f"{profile.lens_name.replace(' ', '_')}_comparison_report.pdf",
+                            )
+                            st.session_state.comparison_report_download = {
+                                "name": report_path.name,
+                                "bytes": report_path.read_bytes(),
+                            }
+                except Exception as exc:
+                    st.error(f"Could not compare the uploaded profile. {_safe_user_message(exc, 'Comparison failed.')}")
             comparison_report = st.session_state.comparison_report_download
             if comparison_report:
                 st.download_button(
@@ -2261,14 +2493,17 @@ def main() -> None:
             )
             uploaded_profile = st.file_uploader("Load Profile", type=["json"], key="load_profile")
             if uploaded_profile is not None:
-                rig.cameras[st.session_state.selected_camera_label] = _load_profile_from_upload(
-                    uploaded_profile.getvalue().decode("utf-8")
-                )
-                st.session_state.profile = rig.cameras[st.session_state.selected_camera_label]
-                _save_profile(st.session_state.profile)
-                _save_rig(rig)
-                st.success(f"Loaded profile: {st.session_state.profile.lens_name}")
-                st.rerun()
+                try:
+                    rig.cameras[st.session_state.selected_camera_label] = _load_profile_from_upload(
+                        uploaded_profile.getvalue().decode("utf-8")
+                    )
+                    st.session_state.profile = rig.cameras[st.session_state.selected_camera_label]
+                    _save_profile(st.session_state.profile)
+                    _save_rig(rig)
+                    st.success(f"Loaded profile: {st.session_state.profile.lens_name}")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not load the selected profile. {_safe_user_message(exc, 'Profile import failed.')}")
 
     with tab_library:
         st.header("Lens Library")
@@ -2289,9 +2524,12 @@ def main() -> None:
         s4.metric("Date Range End", stats["date_max"])
 
         if st.button("Save Current Profile To Library", key="save_current_profile_library"):
-            saved_path = save_to_library(profile)
-            st.success(f"Saved: {saved_path.name}")
-            st.rerun()
+            try:
+                saved_path = save_to_library(profile)
+                st.success(f"Saved: {saved_path.name}")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not save the current profile. {_safe_user_message(exc, 'Library save failed.')}")
 
         if not library_rows:
             st.caption("No profiles found in library with current filters.")
@@ -2328,10 +2566,13 @@ def main() -> None:
                 )
                 include_stmaps = export_mode == "STMap"
                 if st.button("Export Selected To UE ZIP", key="library_export_button"):
-                    selected_profile = load_from_library(selected_filename)
-                    st.session_state.library_export_bundle = _prepare_export_bundle(
-                        selected_profile, export_mode, include_stmaps
-                    )
+                    try:
+                        selected_profile = load_from_library(selected_filename)
+                        st.session_state.library_export_bundle = _prepare_export_bundle(
+                            selected_profile, export_mode, include_stmaps
+                        )
+                    except Exception as exc:
+                        st.error(f"Could not export the selected library profile. {_safe_user_message(exc, 'Export failed.')}")
 
             library_bundle = st.session_state.library_export_bundle
             if library_bundle:
@@ -2375,20 +2616,29 @@ def main() -> None:
             st.caption("STMaps are useful for texture-driven workflows or for inspection alongside the parameter fit.")
 
             if st.button("Generate UE Export Package", type="primary"):
-                st.session_state.export_bundle = _prepare_export_bundle(profile, data_mode, include_stmaps)
+                try:
+                    st.session_state.export_bundle = _prepare_export_bundle(profile, data_mode, include_stmaps)
+                except Exception as exc:
+                    st.error(f"UE export failed. {_safe_user_message(exc, 'Could not generate the package.')}")
             if len(rig.cameras) > 1 and st.button("Generate Multi-Camera UE Package"):
-                st.session_state.multi_export_bundle = _prepare_multi_camera_export_bundle(rig, data_mode, include_stmaps)
+                try:
+                    st.session_state.multi_export_bundle = _prepare_multi_camera_export_bundle(rig, data_mode, include_stmaps)
+                except Exception as exc:
+                    st.error(f"Multi-camera export failed. {_safe_user_message(exc, 'Could not generate the package.')}")
             if st.button("Generate Report"):
-                with lensu_tempdir() as tmpdir:
-                    report_path = generate_calibration_report(
-                        profile,
-                        Path(tmpdir) / f"{profile.lens_name.replace(' ', '_')}_calibration_report.pdf",
-                        include_charts=True,
-                    )
-                    st.session_state.report_download = {
-                        "name": report_path.name,
-                        "bytes": report_path.read_bytes(),
-                    }
+                try:
+                    with lensu_tempdir() as tmpdir:
+                        report_path = generate_calibration_report(
+                            profile,
+                            Path(tmpdir) / f"{profile.lens_name.replace(' ', '_')}_calibration_report.pdf",
+                            include_charts=True,
+                        )
+                        st.session_state.report_download = {
+                            "name": report_path.name,
+                            "bytes": report_path.read_bytes(),
+                        }
+                except Exception as exc:
+                    st.error(f"Report generation failed. {_safe_user_message(exc, 'Could not create the report.')}")
 
             bundle = st.session_state.export_bundle
             if bundle:
@@ -2437,7 +2687,10 @@ def main() -> None:
             st.subheader("Nuke")
             st.caption("Exports a `.nk` script and reusable `.gizmo` for the active camera profile.")
             if st.button("Generate Nuke Export Package"):
-                st.session_state.nuke_export_bundle = _prepare_nuke_bundle(profile)
+                try:
+                    st.session_state.nuke_export_bundle = _prepare_nuke_bundle(profile)
+                except Exception as exc:
+                    st.error(f"Nuke export failed. {_safe_user_message(exc, 'Could not generate the package.')}")
             nuke_bundle = st.session_state.nuke_export_bundle
             if nuke_bundle:
                 st.download_button(
@@ -2451,8 +2704,7 @@ def main() -> None:
                 with st.expander("Nuke Gizmo"):
                     st.code(nuke_bundle["gizmo_text"], language="text")
 
-    _save_profile(profile)
-    _save_rig(rig)
+    _persist_session_state(rig)
     _render_footer()
 
 
