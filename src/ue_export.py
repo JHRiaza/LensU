@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import io
 import json
+import zipfile
 from pathlib import Path
 from typing import Literal, Optional
 
 try:
-    from .calibration import LENSU_VERSION, LensProfile, measured_focal_length_mm, normalized_focal_lengths
+    from .calibration import CameraRig, LENSU_VERSION, LensProfile, measured_focal_length_mm, normalized_focal_lengths
     from .stmap import generate_stmap_from_calibration
 except ImportError:
-    from calibration import LENSU_VERSION, LensProfile, measured_focal_length_mm, normalized_focal_lengths
+    from calibration import CameraRig, LENSU_VERSION, LensProfile, measured_focal_length_mm, normalized_focal_lengths
     from stmap import generate_stmap_from_calibration
 
 
@@ -311,3 +313,53 @@ if __name__ == "__main__":
     script_path = output_path / f"import_{_safe_name(profile.lens_name)}_to_ue.py"
     script_path.write_text(script, encoding="utf-8")
     return script_path
+
+
+def export_ue_multi_camera_package(
+    rig: CameraRig,
+    output_path: Path,
+    data_mode: DataMode = "Parameters",
+    include_stmaps: bool = False,
+) -> Path:
+    """Package one UE export per camera into a single ZIP."""
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest: dict[str, object] = {"rig_name": rig.rig_name, "cameras": {}}
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for label, profile in rig.cameras.items():
+            safe_label = _safe_name(label)
+            camera_dir = Path(safe_label)
+            temp_root = output_path.parent / f".tmp_{safe_label}"
+            temp_root.mkdir(parents=True, exist_ok=True)
+            try:
+                stmap_dir = temp_root / "stmaps"
+                json_path = export_ue_json(
+                    profile=profile,
+                    output_path=temp_root,
+                    data_mode=data_mode,
+                    stmap_directory=stmap_dir,
+                    include_stmaps=include_stmaps,
+                )
+                script_path = export_ue_python_script(profile, json_path.name, temp_root, data_mode=data_mode)
+                archive.write(json_path, str(camera_dir / json_path.name))
+                archive.write(script_path, str(camera_dir / script_path.name))
+                if include_stmaps and stmap_dir.exists():
+                    for stmap_file in sorted(stmap_dir.iterdir()):
+                        archive.write(stmap_file, str(camera_dir / "stmaps" / stmap_file.name))
+                manifest["cameras"][label] = {
+                    "json": str(camera_dir / json_path.name).replace("\\", "/"),
+                    "script": str(camera_dir / script_path.name).replace("\\", "/"),
+                }
+            finally:
+                for path in sorted(temp_root.rglob("*"), reverse=True):
+                    if path.is_file():
+                        path.unlink()
+                    elif path.is_dir():
+                        path.rmdir()
+                if temp_root.exists():
+                    temp_root.rmdir()
+
+        archive.writestr("rig_manifest.json", json.dumps(manifest, indent=2))
+    output_path.write_bytes(buffer.getvalue())
+    return output_path

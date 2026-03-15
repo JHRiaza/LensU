@@ -23,6 +23,7 @@ try:
         calibrate_from_images,
         compute_coverage_heatmap,
     )
+    from .temp_paths import lensu_tempdir
 except ImportError:
     from calibration import (
         CalibrationImageResult,
@@ -35,6 +36,7 @@ except ImportError:
         calibrate_from_images,
         compute_coverage_heatmap,
     )
+    from temp_paths import lensu_tempdir
 
 
 def _state() -> dict[str, Any]:
@@ -113,7 +115,7 @@ def _calibrate_captures(
     mode: str,
     settings: dict[str, Any],
 ) -> tuple[CalibrationPoint | None, CalibrationDiagnostics]:
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with lensu_tempdir() as tmpdir:
         paths: list[Path] = []
         first_image_size: tuple[int, int] | None = None
         for index, capture in enumerate(captures):
@@ -154,7 +156,7 @@ def _calibrate_captures(
         if settings.get("anamorphic_enabled") and mode == "ChArUco":
             desqueezed = bool(settings["anamorphic_desqueezed"])
             squeeze_ratio = float(settings["squeeze_ratio"])
-            with tempfile.TemporaryDirectory() as tmpdir_charuco:
+            with lensu_tempdir() as tmpdir_charuco:
                 temp_dir = Path(tmpdir_charuco)
                 if desqueezed:
                     desqueezed_paths = paths

@@ -18,6 +18,7 @@ try:
         accuracy_grade,
         generate_distortion_grid,
     )
+    from .temp_paths import lensu_tempdir
 except ImportError:
     from calibration import (
         CalibrationPoint,
@@ -25,6 +26,7 @@ except ImportError:
         accuracy_grade,
         generate_distortion_grid,
     )
+    from temp_paths import lensu_tempdir
 
 try:
     import matplotlib
@@ -415,7 +417,7 @@ def generate_calibration_report(
 
     if not profile.calibration_points:
         story.append(_paragraph("No calibration points are available in this profile.", styles["body"]))
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with lensu_tempdir() as tmpdir:
         temp_dir = Path(tmpdir)
         for index, point in enumerate(profile.calibration_points):
             if index > 0:
@@ -668,7 +670,7 @@ def generate_comparison_report(
         story.append(nodal_table)
 
     common_points = sorted(set(points_a) & set(points_b))
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with lensu_tempdir() as tmpdir:
         temp_dir = Path(tmpdir)
         if common_points:
             focal = common_points[0]

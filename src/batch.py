@@ -20,6 +20,7 @@ try:
         calibrate_from_images,
     )
     from .video_extractor import extract_frames_from_video
+    from .temp_paths import lensu_tempdir
 except ImportError:
     from calibration import (
         CalibrationImageResult,
@@ -32,6 +33,7 @@ except ImportError:
         calibrate_from_images,
     )
     from video_extractor import extract_frames_from_video
+    from temp_paths import lensu_tempdir
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
@@ -278,7 +280,7 @@ def batch_calibrate_from_videos(
         ]
         if not video_files:
             continue
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with lensu_tempdir() as tmpdir:
             frame_dir = Path(tmpdir)
             frame_paths = extract_frames_from_video(
                 video_path=video_files[0],

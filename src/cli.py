@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 try:
+    from .api import start_api_server
     from . import __version__
     from .batch import batch_calibrate_detailed
     from .board_generator import generate_charuco_pdf, generate_checkerboard_pdf
@@ -19,9 +20,11 @@ try:
         save_to_library,
         search_library,
     )
+    from .nuke_export import export_nuke_gizmo, export_nuke_script
     from .ue_export import export_ue_json, export_ue_python_script
 except ImportError:
     __version__ = "1.5.0"
+    from api import start_api_server
     from batch import batch_calibrate_detailed
     from board_generator import generate_charuco_pdf, generate_checkerboard_pdf
     from calibration import LensProfile, calibrate_from_charuco_images, calibrate_from_images
@@ -33,6 +36,7 @@ except ImportError:
         save_to_library,
         search_library,
     )
+    from nuke_export import export_nuke_gizmo, export_nuke_script
     from ue_export import export_ue_json, export_ue_python_script
 
 
@@ -197,6 +201,13 @@ def _cmd_export(args: argparse.Namespace) -> int:
     profile = LensProfile.load_json(profile_path)
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.format == "nuke":
+        script_path = export_nuke_script(profile, output_dir / f"{profile.lens_name.replace(' ', '_')}.nk")
+        gizmo_path = export_nuke_gizmo(profile, output_dir / f"{profile.lens_name.replace(' ', '_')}.gizmo")
+        print(f"Exported Nuke script: {script_path}")
+        print(f"Exported Nuke gizmo: {gizmo_path}")
+        return 0
+
     stmap_dir = output_dir / "stmaps"
     data_mode = "STMap" if args.include_stmaps else "Parameters"
     json_path = export_ue_json(
@@ -212,6 +223,12 @@ def _cmd_export(args: argparse.Namespace) -> int:
     if args.include_stmaps and stmap_dir.exists():
         stmaps = sorted(stmap_dir.glob("*"))
         print(f"Exported STMaps: {len(stmaps)}")
+    return 0
+
+
+def _cmd_serve(args: argparse.Namespace) -> int:
+    print(f"Starting LensU API server on {args.host}:{args.port}")
+    start_api_server(host=args.host, port=int(args.port))
     return 0
 
 
@@ -313,10 +330,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     export = subparsers.add_parser("export", help="Export profile for Unreal Engine")
     export.add_argument("--profile", required=True, help="Input profile JSON")
-    export.add_argument("--format", choices=["ue"], default="ue", help="Export format")
+    export.add_argument("--format", choices=["ue", "nuke"], default="ue", help="Export format")
     export.add_argument("--output", required=True, help="Output directory")
     export.add_argument("--include-stmaps", action="store_true", help="Include STMap files")
     export.set_defaults(func=_cmd_export)
+
+    serve = subparsers.add_parser("serve", help="Start the LensU REST API server")
+    serve.add_argument("--host", default="0.0.0.0", help="Bind host")
+    serve.add_argument("--port", type=int, default=8600, help="Bind port")
+    serve.set_defaults(func=_cmd_serve)
 
     board = subparsers.add_parser("board", help="Generate printable calibration board")
     board.add_argument("--type", choices=["checkerboard", "charuco"], required=True)

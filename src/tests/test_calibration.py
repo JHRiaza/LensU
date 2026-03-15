@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from calibration import AnamorphicInfo, CalibrationPoint, LensProfile
+from calibration import AnamorphicInfo, CalibrationPoint, CameraRig, LensProfile
 from test_support import workspace_tempdir
 
 
@@ -62,6 +62,25 @@ class CalibrationTests(unittest.TestCase):
         profile.add_calibration(point)
         self.assertTrue(profile.calibration_points[0].is_fisheye)
         self.assertEqual(profile.calibration_points[0].fisheye_coeffs[0], 0.1)
+
+    def test_camera_rig_json_roundtrip(self):
+        rig = CameraRig(rig_name="VP Stage")
+        main = LensProfile(lens_name="Main Cam")
+        witness = LensProfile(lens_name="Witness Cam")
+        main.add_calibration(CalibrationPoint(focal_length_mm=35.0, k1=-0.02))
+        witness.add_calibration(CalibrationPoint(focal_length_mm=50.0, k1=-0.01))
+        rig.add_camera("Main", main)
+        rig.add_camera("Witness", witness)
+
+        with workspace_tempdir() as tmpdir:
+            path = tmpdir / "rig.json"
+            rig.save_json(path)
+            loaded = CameraRig.load_json(path)
+
+        self.assertEqual(loaded.rig_name, "VP Stage")
+        self.assertEqual(sorted(loaded.cameras.keys()), ["Main", "Witness"])
+        self.assertEqual(loaded.cameras["Main"].calibration_points[0].focal_length_mm, 35.0)
+        self.assertEqual(loaded.cameras["Witness"].lens_name, "Witness Cam")
 
 
 if __name__ == "__main__":

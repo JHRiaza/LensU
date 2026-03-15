@@ -14,8 +14,10 @@ import numpy as np
 
 try:
     from . import __version__
+    from .temp_paths import lensu_tempdir
 except ImportError:
     __version__ = "1.5.0"
+    from temp_paths import lensu_tempdir
 
 LENSU_VERSION = __version__
 
@@ -154,6 +156,32 @@ class LensProfile:
 
 
 @dataclass
+class CameraRig:
+    """A collection of labeled cameras with their own lens profiles."""
+
+    rig_name: str = "Default Rig"
+    cameras: dict[str, LensProfile] = field(default_factory=dict)
+
+    def add_camera(self, label: str, profile: LensProfile) -> None:
+        cleaned = label.strip() or f"Camera {len(self.cameras) + 1}"
+        self.cameras[cleaned] = profile
+
+    def to_dict(self) -> dict:
+        return {
+            "rig_name": self.rig_name,
+            "cameras": {label: profile.to_dict() for label, profile in self.cameras.items()},
+        }
+
+    def save_json(self, path: Path) -> None:
+        path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+
+    @classmethod
+    def load_json(cls, path: Path) -> "CameraRig":
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return camera_rig_from_dict(data)
+
+
+@dataclass
 class CalibrationImageResult:
     """Detection and fit details for a single source image."""
 
@@ -220,6 +248,16 @@ def lens_profile_from_dict(data: dict) -> LensProfile:
     profile.nodal_offsets.sort(key=lambda point: point.focal_length_mm)
     profile.breathing_profiles.sort(key=lambda point: point.nominal_focal_length_mm)
     return profile
+
+
+def camera_rig_from_dict(data: dict) -> CameraRig:
+    rig = CameraRig(rig_name=data.get("rig_name", "Default Rig"))
+    cameras = data.get("cameras", {})
+    if isinstance(cameras, dict):
+        for label, profile_data in cameras.items():
+            if isinstance(profile_data, dict):
+                rig.add_camera(label, lens_profile_from_dict(profile_data))
+    return rig
 
 
 def aruco_available() -> bool:
@@ -596,7 +634,7 @@ def calibrate_anamorphic_detailed(
     if squeeze_ratio <= 0:
         raise ValueError("Squeeze ratio must be positive.")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with lensu_tempdir() as tmpdir:
         temp_dir = Path(tmpdir)
         if desqueezed:
             desqueezed_paths = image_paths

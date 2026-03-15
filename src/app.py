@@ -25,6 +25,7 @@ try:
     from .calibration import (
         AnamorphicInfo,
         BreathingPoint,
+        CameraRig,
         CalibrationDiagnostics,
         CalibrationImageResult,
         CalibrationPoint,
@@ -42,6 +43,7 @@ try:
         estimate_nodal_from_parallax,
         generate_barrel_pincushion_visualization,
         generate_distortion_grid,
+        camera_rig_from_dict,
         lens_profile_from_dict,
         measured_focal_length_mm,
         undistort_image,
@@ -55,11 +57,13 @@ try:
         search_library,
     )
     from .live_calibration import live_calibration_ui
+    from .nuke_export import export_nuke_gizmo, export_nuke_script
     from .presets import list_presets, load_preset
     from .protocols.freed import FreeDPacket, freed_to_fiz, start_freed_listener
     from .protocols.opentrackio import OpenTrackIOSample, map_opentrackio_fiz, start_opentrackio_listener
     from .report import generate_calibration_report, generate_comparison_report
-    from .ue_export import export_ue_json, export_ue_python_script
+    from .temp_paths import lensu_tempdir
+    from .ue_export import export_ue_json, export_ue_multi_camera_package, export_ue_python_script
     from .video_extractor import extract_frames_from_video, extract_frames_with_checkerboard
 except ImportError:
     from board_generator import generate_charuco_pdf, generate_checkerboard_pdf
@@ -67,6 +71,7 @@ except ImportError:
     from calibration import (
         AnamorphicInfo,
         BreathingPoint,
+        CameraRig,
         CalibrationDiagnostics,
         CalibrationImageResult,
         CalibrationPoint,
@@ -84,6 +89,7 @@ except ImportError:
         estimate_nodal_from_parallax,
         generate_barrel_pincushion_visualization,
         generate_distortion_grid,
+        camera_rig_from_dict,
         lens_profile_from_dict,
         measured_focal_length_mm,
         undistort_image,
@@ -97,16 +103,19 @@ except ImportError:
         search_library,
     )
     from live_calibration import live_calibration_ui
+    from nuke_export import export_nuke_gizmo, export_nuke_script
     from presets import list_presets, load_preset
     from protocols.freed import FreeDPacket, freed_to_fiz, start_freed_listener
     from protocols.opentrackio import OpenTrackIOSample, map_opentrackio_fiz, start_opentrackio_listener
     from report import generate_calibration_report, generate_comparison_report
-    from ue_export import export_ue_json, export_ue_python_script
+    from temp_paths import lensu_tempdir
+    from ue_export import export_ue_json, export_ue_multi_camera_package, export_ue_python_script
     from video_extractor import extract_frames_from_video, extract_frames_with_checkerboard
 
 
 APP_VERSION = f"v{__version__}" if "__version__" in globals() else "v1.5.0"
 PROFILE_STATE_PATH = Path.home() / ".lensu" / "current_profile.json"
+RIG_STATE_PATH = Path.home() / ".lensu" / "current_rig.json"
 
 st.set_page_config(page_title="LensU", page_icon="L", layout="wide")
 
@@ -129,13 +138,54 @@ def _load_persisted_profile() -> LensProfile:
     return LensProfile()
 
 
+def _load_persisted_rig() -> CameraRig:
+    try:
+        if RIG_STATE_PATH.exists():
+            return CameraRig.load_json(RIG_STATE_PATH)
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        pass
+    profile = _load_persisted_profile()
+    rig = CameraRig()
+    rig.add_camera("Camera A", profile)
+    return rig
+
+
 def _save_profile(profile: LensProfile) -> None:
     PROFILE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     profile.save_json(PROFILE_STATE_PATH)
 
 
+def _save_rig(rig: CameraRig) -> None:
+    RIG_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    rig.save_json(RIG_STATE_PATH)
+
+
+def _active_rig() -> CameraRig:
+    return st.session_state.camera_rig
+
+
+def _active_profile() -> LensProfile:
+    rig = _active_rig()
+    label = st.session_state.selected_camera_label
+    if label not in rig.cameras:
+        fallback = next(iter(rig.cameras), "Camera A")
+        if fallback not in rig.cameras:
+            rig.add_camera(fallback, LensProfile())
+        st.session_state.selected_camera_label = fallback
+        label = fallback
+    st.session_state.profile = rig.cameras[label]
+    return st.session_state.profile
+
+
+if "camera_rig" not in st.session_state:
+    st.session_state.camera_rig = _load_persisted_rig()
+if "selected_camera_label" not in st.session_state:
+    labels = list(st.session_state.camera_rig.cameras) or ["Camera A"]
+    if not st.session_state.camera_rig.cameras:
+        st.session_state.camera_rig.add_camera(labels[0], LensProfile())
+    st.session_state.selected_camera_label = labels[0]
 if "profile" not in st.session_state:
-    st.session_state.profile = _load_persisted_profile()
+    st.session_state.profile = st.session_state.camera_rig.cameras[st.session_state.selected_camera_label]
 if "calibration_runs" not in st.session_state:
     st.session_state.calibration_runs = {}
 if "extracted_frames" not in st.session_state:
@@ -144,6 +194,10 @@ if "board_download" not in st.session_state:
     st.session_state.board_download = None
 if "export_bundle" not in st.session_state:
     st.session_state.export_bundle = None
+if "multi_export_bundle" not in st.session_state:
+    st.session_state.multi_export_bundle = None
+if "nuke_export_bundle" not in st.session_state:
+    st.session_state.nuke_export_bundle = None
 if "batch_results" not in st.session_state:
     st.session_state.batch_results = []
 if "library_export_bundle" not in st.session_state:
@@ -368,7 +422,7 @@ def _calibrate_charuco_anamorphic(
     squeeze_ratio: float,
     desqueezed: bool,
 ) -> tuple[CalibrationPoint | None, CalibrationDiagnostics]:
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with lensu_tempdir() as tmpdir:
         temp_dir = Path(tmpdir)
         if desqueezed:
             desqueezed_paths = image_paths
@@ -445,7 +499,7 @@ def _calibrate_files(
 ) -> tuple[CalibrationPoint | None, CalibrationDiagnostics, list[dict[str, Any]]]:
     excluded_names = excluded_names or set()
     file_payloads: list[dict[str, Any]] = []
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with lensu_tempdir() as tmpdir:
         image_paths: list[Path] = []
         first_image_size: tuple[int, int] | None = None
         for uploaded in uploaded_files:
@@ -679,7 +733,7 @@ def _render_board_generator_sidebar(dictionary_names: dict[str, int]) -> None:
 
     if st.button("Generate Board PDF", use_container_width=True):
         try:
-            with tempfile.TemporaryDirectory() as tmpdir:
+            with lensu_tempdir() as tmpdir:
                 output_path = Path(tmpdir) / f"{board_type.lower()}_{page_size.lower()}.pdf"
                 if board_type == "Checkerboard":
                     generate_checkerboard_pdf(
@@ -968,7 +1022,7 @@ def _render_breathing_chart(profile) -> None:
 
 
 def _prepare_export_bundle(profile: LensProfile, data_mode: str, include_stmaps: bool) -> dict[str, Any]:
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with lensu_tempdir() as tmpdir:
         tmp_path = Path(tmpdir)
         stmap_dir = tmp_path / "stmaps"
         has_fisheye = any(point.is_fisheye for point in profile.calibration_points)
@@ -997,6 +1051,42 @@ def _prepare_export_bundle(profile: LensProfile, data_mode: str, include_stmaps:
             "zip_size": len(zip_bytes),
             "json_text": json_path.read_text(encoding="utf-8"),
             "script_text": script_path.read_text(encoding="utf-8"),
+        }
+
+
+def _prepare_multi_camera_export_bundle(rig: CameraRig, data_mode: str, include_stmaps: bool) -> dict[str, Any]:
+    with lensu_tempdir() as tmpdir:
+        tmp_path = Path(tmpdir)
+        zip_path = export_ue_multi_camera_package(
+            rig=rig,
+            output_path=tmp_path / f"{rig.rig_name.replace(' ', '_')}_ue_package.zip",
+            data_mode=data_mode,
+            include_stmaps=include_stmaps,
+        )
+        zip_bytes = zip_path.read_bytes()
+        return {
+            "name": zip_path.name,
+            "bytes": zip_bytes,
+            "zip_size": len(zip_bytes),
+        }
+
+
+def _prepare_nuke_bundle(profile: LensProfile) -> dict[str, Any]:
+    with lensu_tempdir() as tmpdir:
+        tmp_path = Path(tmpdir)
+        script_path = export_nuke_script(profile, tmp_path / f"{profile.lens_name.replace(' ', '_')}.nk")
+        gizmo_path = export_nuke_gizmo(profile, tmp_path / f"{profile.lens_name.replace(' ', '_')}.gizmo")
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.write(script_path, script_path.name)
+            archive.write(gizmo_path, gizmo_path.name)
+        zip_bytes = zip_buffer.getvalue()
+        return {
+            "name": f"LensU_{profile.lens_name.replace(' ', '_')}_Nuke.zip",
+            "bytes": zip_bytes,
+            "zip_size": len(zip_bytes),
+            "script_text": script_path.read_text(encoding="utf-8"),
+            "gizmo_text": gizmo_path.read_text(encoding="utf-8"),
         }
 
 
@@ -1196,11 +1286,47 @@ def _render_live_tracking_tab(profile: LensProfile) -> None:
 
 
 def main() -> None:
-    profile: LensProfile = st.session_state.profile
+    rig: CameraRig = _active_rig()
+    profile: LensProfile = _active_profile()
     _render_header()
 
     with st.sidebar:
         st.header("Lens Setup")
+        rig.rig_name = st.text_input("Rig Name", value=rig.rig_name)
+        st.subheader("Cameras")
+        camera_labels = list(rig.cameras.keys())
+        selected_camera = st.selectbox(
+            "Active Camera",
+            camera_labels,
+            index=max(camera_labels.index(st.session_state.selected_camera_label), 0),
+            key="camera_selector",
+        )
+        if selected_camera != st.session_state.selected_camera_label:
+            st.session_state.selected_camera_label = selected_camera
+            st.session_state.profile = rig.cameras[selected_camera]
+            st.rerun()
+
+        new_camera_label = st.text_input("Camera Label", value="", key="new_camera_label")
+        if st.button("Add Camera", use_container_width=True):
+            candidate = new_camera_label.strip() or f"Camera {len(rig.cameras) + 1}"
+            if candidate in rig.cameras:
+                st.warning("Camera label already exists.")
+            else:
+                template = LensProfile(
+                    lens_name=profile.lens_name,
+                    sensor_width_mm=profile.sensor_width_mm,
+                    sensor_height_mm=profile.sensor_height_mm,
+                    image_width=profile.image_width,
+                    image_height=profile.image_height,
+                )
+                rig.add_camera(candidate, template)
+                st.session_state.selected_camera_label = candidate
+                st.session_state.profile = rig.cameras[candidate]
+                _save_rig(rig)
+                st.rerun()
+        st.caption(f"{len(rig.cameras)} camera(s) in this session.")
+
+        profile = _active_profile()
         profile.lens_name = st.text_input(
             "Lens Name",
             value=profile.lens_name,
@@ -1215,8 +1341,10 @@ def main() -> None:
         )
         st.warning("Preset values are approximate. Always calibrate your specific lens for VP work.")
         if selected_preset != "None" and st.button("Load Selected Preset", use_container_width=True):
-            st.session_state.profile = load_preset(selected_preset)
+            rig.cameras[st.session_state.selected_camera_label] = load_preset(selected_preset)
+            st.session_state.profile = rig.cameras[st.session_state.selected_camera_label]
             _save_profile(st.session_state.profile)
+            _save_rig(rig)
             st.success(f"Loaded preset: {st.session_state.profile.lens_name}")
             st.rerun()
 
@@ -1575,7 +1703,7 @@ def main() -> None:
             )
 
         if video_file is not None and st.button("Extract Frames", type="primary"):
-            with tempfile.TemporaryDirectory() as tmpdir:
+            with lensu_tempdir() as tmpdir:
                 tmp_path = Path(tmpdir)
                 suffix = Path(video_file.name).suffix or ".mp4"
                 video_path = tmp_path / f"uploaded_video{suffix}"
@@ -1968,6 +2096,7 @@ def main() -> None:
 
     with tab_profile:
         st.header("Lens Profile")
+        st.caption(f"Active camera: {st.session_state.selected_camera_label} | Rig: {rig.rig_name}")
         if profile.anamorphic is not None:
             st.info(
                 f"Anamorphic profile: {profile.anamorphic.squeeze_ratio:.2f}x | "
@@ -2103,7 +2232,7 @@ def main() -> None:
                 comparison_rows = _compare_profiles(profile, other_profile)
                 st.dataframe(comparison_rows, use_container_width=True)
                 if st.button("Generate Comparison Report", key="generate_comparison_report"):
-                    with tempfile.TemporaryDirectory() as tmpdir:
+                    with lensu_tempdir() as tmpdir:
                         report_path = generate_comparison_report(
                             profile,
                             other_profile,
@@ -2132,8 +2261,12 @@ def main() -> None:
             )
             uploaded_profile = st.file_uploader("Load Profile", type=["json"], key="load_profile")
             if uploaded_profile is not None:
-                st.session_state.profile = _load_profile_from_upload(uploaded_profile.getvalue().decode("utf-8"))
+                rig.cameras[st.session_state.selected_camera_label] = _load_profile_from_upload(
+                    uploaded_profile.getvalue().decode("utf-8")
+                )
+                st.session_state.profile = rig.cameras[st.session_state.selected_camera_label]
                 _save_profile(st.session_state.profile)
+                _save_rig(rig)
                 st.success(f"Loaded profile: {st.session_state.profile.lens_name}")
                 st.rerun()
 
@@ -2174,8 +2307,10 @@ def main() -> None:
             action_cols = st.columns(3)
             with action_cols[0]:
                 if st.button("Load Into Session", type="primary", key="library_load_button"):
-                    st.session_state.profile = load_from_library(selected_filename)
+                    rig.cameras[st.session_state.selected_camera_label] = load_from_library(selected_filename)
+                    st.session_state.profile = rig.cameras[st.session_state.selected_camera_label]
                     _save_profile(st.session_state.profile)
+                    _save_rig(rig)
                     st.success(f"Loaded: {selected_filename}")
                     st.rerun()
             with action_cols[1]:
@@ -2215,10 +2350,11 @@ def main() -> None:
                 )
 
     with tab_export:
-        st.header("Export to Unreal Engine")
+        st.header("Export")
         if not profile.calibration_points:
             st.warning("No calibration data available. Run at least one distortion calibration first.")
         else:
+            st.subheader("Unreal Engine")
             has_fisheye = any(point.is_fisheye for point in profile.calibration_points)
             data_mode = st.radio(
                 "UE Data Mode",
@@ -2240,8 +2376,10 @@ def main() -> None:
 
             if st.button("Generate UE Export Package", type="primary"):
                 st.session_state.export_bundle = _prepare_export_bundle(profile, data_mode, include_stmaps)
+            if len(rig.cameras) > 1 and st.button("Generate Multi-Camera UE Package"):
+                st.session_state.multi_export_bundle = _prepare_multi_camera_export_bundle(rig, data_mode, include_stmaps)
             if st.button("Generate Report"):
-                with tempfile.TemporaryDirectory() as tmpdir:
+                with lensu_tempdir() as tmpdir:
                     report_path = generate_calibration_report(
                         profile,
                         Path(tmpdir) / f"{profile.lens_name.replace(' ', '_')}_calibration_report.pdf",
@@ -2268,6 +2406,14 @@ def main() -> None:
                 with st.expander("UE Python Script"):
                     st.code(bundle["script_text"], language="python")
                     _copy_text_button("Copy to clipboard", bundle["script_text"], key="copy_ue_script")
+            multi_bundle = st.session_state.multi_export_bundle
+            if multi_bundle:
+                st.download_button(
+                    "Download Multi-Camera UE Package (.zip)",
+                    data=multi_bundle["bytes"],
+                    file_name=multi_bundle["name"],
+                    mime="application/zip",
+                )
             report_bundle = st.session_state.report_download
             if report_bundle:
                 st.download_button(
@@ -2287,7 +2433,26 @@ def main() -> None:
                 """
             )
 
+            st.divider()
+            st.subheader("Nuke")
+            st.caption("Exports a `.nk` script and reusable `.gizmo` for the active camera profile.")
+            if st.button("Generate Nuke Export Package"):
+                st.session_state.nuke_export_bundle = _prepare_nuke_bundle(profile)
+            nuke_bundle = st.session_state.nuke_export_bundle
+            if nuke_bundle:
+                st.download_button(
+                    "Download Nuke Package (.zip)",
+                    data=nuke_bundle["bytes"],
+                    file_name=nuke_bundle["name"],
+                    mime="application/zip",
+                )
+                with st.expander("Nuke Script"):
+                    st.code(nuke_bundle["script_text"], language="text")
+                with st.expander("Nuke Gizmo"):
+                    st.code(nuke_bundle["gizmo_text"], language="text")
+
     _save_profile(profile)
+    _save_rig(rig)
     _render_footer()
 
 

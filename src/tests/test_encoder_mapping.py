@@ -22,6 +22,17 @@ class EncoderMappingTests(unittest.TestCase):
         self.assertAlmostEqual(mapping.encoder_to_zoom(500), 37.0)
         self.assertAlmostEqual(mapping.encoder_to_iris(500), 3.0)
 
+    def test_interpolation_accuracy_across_multiple_segments(self):
+        mapping = EncoderMapping(
+            lens_name="Test Lens",
+            focus_map=[(0, 1.0), (1000, 3.0), (4000, 9.0)],
+            zoom_map=[],
+            iris_map=[],
+        )
+        self.assertAlmostEqual(mapping.encoder_to_focus(250), 1.5)
+        self.assertAlmostEqual(mapping.encoder_to_focus(2500), 6.0)
+        self.assertAlmostEqual(mapping.encoder_to_focus(99999), 9.0)
+
 
 if __name__ == "__main__":
     unittest.main()
