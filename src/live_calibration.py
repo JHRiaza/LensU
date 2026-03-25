@@ -52,24 +52,58 @@ def _state() -> dict[str, Any]:
     return st.session_state.live_calibration_state
 
 
-def list_camera_devices(max_devices: int = 5) -> list[dict[str, Any]]:
+def _try_open_device(index: int, backend: int | None = None) -> cv2.VideoCapture | None:
+    """Try to open a capture device with an optional backend."""
+    if backend is not None:
+        cap = cv2.VideoCapture(index, backend)
+    else:
+        cap = cv2.VideoCapture(index)
+    if cap.isOpened():
+        return cap
+    cap.release()
+    return None
+
+
+def _preferred_backends() -> list[tuple[int, str]]:
+    """Return backends to try, in priority order for Decklink/pro capture cards."""
+    import sys
+    backends: list[tuple[int, str]] = []
+    if sys.platform == "win32":
+        backends.append((cv2.CAP_DSHOW, "DirectShow"))
+        backends.append((cv2.CAP_MSMF, "Media Foundation"))
+    elif sys.platform == "darwin":
+        backends.append((cv2.CAP_AVFOUNDATION, "AVFoundation"))
+    else:
+        backends.append((cv2.CAP_V4L2, "V4L2"))
+    backends.append((cv2.CAP_ANY, "Auto"))
+    return backends
+
+
+def list_camera_devices(max_devices: int = 10) -> list[dict[str, Any]]:
     devices: list[dict[str, Any]] = []
-    for index in range(max_devices):
-        capture = cv2.VideoCapture(index)
-        if capture.isOpened():
-            ok, frame = capture.read()
-            width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-            height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-            if ok and frame is not None:
-                height = int(frame.shape[0])
-                width = int(frame.shape[1])
-            devices.append(
-                {
-                    "index": index,
-                    "label": f"Camera {index}" + (f" ({width}x{height})" if width and height else ""),
-                }
-            )
-        capture.release()
+    seen_indices: set[int] = set()
+    for backend_id, backend_name in _preferred_backends():
+        for index in range(max_devices):
+            if index in seen_indices:
+                continue
+            capture = _try_open_device(index, backend_id)
+            if capture is not None:
+                ok, frame = capture.read()
+                width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                if ok and frame is not None:
+                    height = int(frame.shape[0])
+                    width = int(frame.shape[1])
+                res = f" ({width}x{height})" if width and height else ""
+                devices.append(
+                    {
+                        "index": index,
+                        "backend": backend_id,
+                        "label": f"Camera {index}{res} [{backend_name}]",
+                    }
+                )
+                seen_indices.add(index)
+                capture.release()
     return devices
 
 
@@ -262,11 +296,10 @@ def _coverage_metrics(diagnostics: CalibrationDiagnostics) -> tuple[float, np.nd
     return occupied / float(total), heatmap
 
 
-def _capture_preview_frame(camera_index: int) -> tuple[np.ndarray | None, str | None]:
-    capture = cv2.VideoCapture(camera_index)
-    if not capture.isOpened():
-        capture.release()
-        return None, "Camera is not available."
+def _capture_preview_frame(camera_index: int, backend: int | None = None) -> tuple[np.ndarray | None, str | None]:
+    capture = _try_open_device(camera_index, backend)
+    if capture is None:
+        return None, "Camera is not available. Check that the device and drivers are installed."
     ok, frame = capture.read()
     capture.release()
     if not ok or frame is None:
@@ -314,7 +347,7 @@ def live_calibration_ui(
             selected_label = st.selectbox("Camera Device", [device["label"] for device in devices])
             selected_device = next(device for device in devices if device["label"] == selected_label)
             if st.button("Refresh Preview"):
-                preview, source_error = _capture_preview_frame(int(selected_device["index"]))
+                preview, source_error = _capture_preview_frame(int(selected_device["index"]), selected_device.get("backend"))
                 if preview is not None:
                     success, encoded = cv2.imencode(".png", preview)
                     if success:

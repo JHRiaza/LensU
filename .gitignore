@@ -7,3 +7,5 @@ build/
 .tmp_test/
 *.tiff
 *.exr
+pip_temp/
+.streamlit/secrets.toml

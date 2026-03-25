@@ -3031,4 +3031,13 @@ def launch() -> None:
 
 
 if __name__ == "__main__":
-    launch()
+    # When run via `streamlit run`, the script is executed as __main__
+    # but the runtime is already active — call main() directly.
+    import streamlit.runtime.scriptrunner as _sr
+    try:
+        _sr.get_script_run_ctx()
+        # Inside Streamlit runtime — render the app
+        main()
+    except Exception:
+        # Not inside Streamlit — launch it
+        launch()
