@@ -65,7 +65,7 @@ def _try_open_device(index: int, backend: int | None = None) -> cv2.VideoCapture
 
 
 def _preferred_backends() -> list[tuple[int, str]]:
-    """Return backends to try, in priority order for Decklink/pro capture cards."""
+    """Return backends to try, in priority order for Decklink/AJA/pro capture cards."""
     import sys
     backends: list[tuple[int, str]] = []
     if sys.platform == "win32":
@@ -77,6 +77,42 @@ def _preferred_backends() -> list[tuple[int, str]]:
         backends.append((cv2.CAP_V4L2, "V4L2"))
     backends.append((cv2.CAP_ANY, "Auto"))
     return backends
+
+
+def _detect_pro_card_name(index: int, backend: int) -> str | None:
+    """Try to identify Blackmagic DeckLink or AJA cards by device name."""
+    cap = _try_open_device(index, backend)
+    if cap is None:
+        return None
+    name = cap.getBackendName() if hasattr(cap, "getBackendName") else ""
+    cap.release()
+    name_lower = name.lower() if name else ""
+    if "decklink" in name_lower or "blackmagic" in name_lower:
+        return f"Blackmagic DeckLink"
+    if "aja" in name_lower or "corvid" in name_lower or "kona" in name_lower:
+        return f"AJA"
+    return None
+
+
+def configure_sdi_capture(
+    cap: cv2.VideoCapture,
+    width: int = 1920,
+    height: int = 1080,
+    fps: float = 25.0,
+) -> cv2.VideoCapture:
+    """Configure a capture device for SDI-grade resolution and frame rate.
+
+    Blackmagic DeckLink and AJA cards accept resolution/fps via OpenCV
+    properties when accessed through DirectShow or Media Foundation.
+    Common SDI formats: 1920x1080@25 (HD), 3840x2160@25 (UHD).
+    """
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    cap.set(cv2.CAP_PROP_FPS, fps)
+    # Disable auto-exposure and auto-white-balance for consistent calibration frames
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0)
+    cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+    return cap
 
 
 def list_camera_devices(max_devices: int = 10) -> list[dict[str, Any]]:
@@ -94,12 +130,21 @@ def list_camera_devices(max_devices: int = 10) -> list[dict[str, Any]]:
                 if ok and frame is not None:
                     height = int(frame.shape[0])
                     width = int(frame.shape[1])
+                # Try to identify pro capture cards
+                pro_name = _detect_pro_card_name(index, backend_id)
+                if pro_name:
+                    label_prefix = pro_name
+                    card_type = "sdi"
+                else:
+                    label_prefix = "Camera"
+                    card_type = "usb"
                 res = f" ({width}x{height})" if width and height else ""
                 devices.append(
                     {
                         "index": index,
                         "backend": backend_id,
-                        "label": f"Camera {index}{res} [{backend_name}]",
+                        "label": f"{label_prefix} {index}{res} [{backend_name}]",
+                        "card_type": card_type,
                     }
                 )
                 seen_indices.add(index)
@@ -296,10 +341,19 @@ def _coverage_metrics(diagnostics: CalibrationDiagnostics) -> tuple[float, np.nd
     return occupied / float(total), heatmap
 
 
-def _capture_preview_frame(camera_index: int, backend: int | None = None) -> tuple[np.ndarray | None, str | None]:
+def _capture_preview_frame(
+    camera_index: int,
+    backend: int | None = None,
+    sdi_width: int = 1920,
+    sdi_height: int = 1080,
+    sdi_fps: float = 25.0,
+    is_sdi: bool = False,
+) -> tuple[np.ndarray | None, str | None]:
     capture = _try_open_device(camera_index, backend)
     if capture is None:
         return None, "Camera is not available. Check that the device and drivers are installed."
+    if is_sdi:
+        configure_sdi_capture(capture, sdi_width, sdi_height, sdi_fps)
     ok, frame = capture.read()
     capture.release()
     if not ok or frame is None:
@@ -342,12 +396,33 @@ def live_calibration_ui(
             frame_name = captured.name or f"camera_{int(time.time())}.jpg"
     else:
         if not devices:
-            st.warning("No OpenCV camera devices were detected.")
+            st.warning("No OpenCV camera devices were detected. For SDI cards (Blackmagic DeckLink, AJA), ensure drivers are installed and the card appears in Device Manager under 'Sound, video and game controllers'.")
         else:
             selected_label = st.selectbox("Camera Device", [device["label"] for device in devices])
             selected_device = next(device for device in devices if device["label"] == selected_label)
+
+            # SDI card configuration
+            sdi_width, sdi_height, sdi_fps = 1920, 1080, 25.0
+            if selected_device.get("card_type") == "sdi":
+                st.info(f"SDI capture card detected ({selected_device['label']}). Configure signal format below.")
+                sdi_cols = st.columns(3)
+                sdi_format = sdi_cols[0].selectbox("SDI Format", ["1920x1080 (HD)", "3840x2160 (UHD)", "1280x720 (720p)"])
+                sdi_fps = sdi_cols[1].selectbox("Frame Rate", [25.0, 29.97, 50.0, 59.94, 23.976, 24.0], index=0)
+                if "3840" in sdi_format:
+                    sdi_width, sdi_height = 3840, 2160
+                elif "1280" in sdi_format:
+                    sdi_width, sdi_height = 1280, 720
+
             if st.button("Refresh Preview"):
-                preview, source_error = _capture_preview_frame(int(selected_device["index"]), selected_device.get("backend"))
+                is_sdi = selected_device.get("card_type") == "sdi"
+                preview, source_error = _capture_preview_frame(
+                    int(selected_device["index"]),
+                    selected_device.get("backend"),
+                    sdi_width=sdi_width,
+                    sdi_height=sdi_height,
+                    sdi_fps=sdi_fps,
+                    is_sdi=is_sdi,
+                )
                 if preview is not None:
                     success, encoded = cv2.imencode(".png", preview)
                     if success:
